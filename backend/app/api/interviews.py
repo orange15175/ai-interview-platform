@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 from typing import Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, UploadFile
@@ -44,7 +45,45 @@ router = APIRouter(prefix="/interviews", tags=["interviews"])
 # 进程内"正在准备"登记表。只用于孤儿检测，不承担跨进程语义。
 _preparing: set[str] = set()
 
+# 本进程启动时刻。早于它创建的 PREPARING 会话，必然是上一个进程留下的孤儿。
+_PROCESS_STARTED_AT = datetime.now(timezone.utc)
+
+# 本进程创建、但登记表里没有的 PREPARING 会话，要等这么久才判孤儿。
+# 为什么需要这层兜底：多 worker 部署时，会话可能正在**别的** worker 上解析出题，
+# 用"不在我的登记表里"直接判死，会把好好的会话标成失败（该任务随后发现状态已变，
+# 会静默跳过 → 会话永久失败）。等超时是唯一的无损判据。
+_PREPARATION_TIMEOUT_SECONDS = 180
+
 MAX_QUESTION_COUNT = 30  # 出题数上限（防费用失控，§11）
+
+
+def _as_aware_utc(value: datetime | None) -> datetime | None:
+    """统一成带时区的 UTC。
+
+    PG 的 timestamptz 读回来已带时区；SQLite（测试）不存时区，读回来是 naive，
+    而写入时用的就是 UTC，所以无时区按 UTC 解释是安全的。
+    """
+    if value is None:
+        return None
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc)
+    return value.replace(tzinfo=timezone.utc)
+
+
+def _is_orphan_preparing(session, session_id: str) -> bool:
+    """这个 PREPARING 会话是不是没人管了（进程重启/任务丢失）。"""
+    if session_id in _preparing:
+        return False  # 本进程正在跑，绝不误杀
+
+    created = _as_aware_utc(session.created_at)
+    if created is None:
+        return True  # 连时间都没有：数据异常，按孤儿收口，别让它永远 PREPARING
+
+    if created < _PROCESS_STARTED_AT:
+        return True  # 重启前的会话：没人会再推进它了
+
+    age = (datetime.now(timezone.utc) - created).total_seconds()
+    return age > _PREPARATION_TIMEOUT_SECONDS
 
 
 # ---------------------------------------------------------------- 请求模型
@@ -87,14 +126,37 @@ def _validate_question_count(count: int | None) -> int | None:
     return count
 
 
-async def _read_upload(file: UploadFile | None) -> tuple[str | None, bytes | None]:
-    """读上传文件字节。None 传 None；空文件视同未提供。"""
+async def _read_upload(
+    file: UploadFile | None, *, limit_mb: int, label: str
+) -> tuple[str | None, bytes | None]:
+    """分块读取上传文件，**累计超限立刻中止**。
+
+    为什么不能直接 await file.read()：那是先把整个文件读进内存再校验大小，
+    10 MiB 的限制只是事后检查。真有人传 1 GiB，进程会先把内存吃满再报错。
+    分块读 + 累计判断，超过上限时立刻停手，最坏只多读一个分片。
+    """
     if file is None:
         return None, None
-    data = await file.read()
-    if not data:
+
+    limit = limit_mb * 1024 * 1024
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(256 * 1024)  # 每片 256 KiB
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise AppError(
+                f"{label}超过 {limit_mb} MiB 上限，请压缩后再上传",
+                code="FILE_TOO_LARGE",
+                http_status=422,
+            )
+        chunks.append(chunk)
+
+    if total == 0:
         return None, None
-    return file.filename or "", data
+    return file.filename or "", b"".join(chunks)
 
 
 def _quick_validate(filename: str | None, data: bytes | None, label: str) -> None:
@@ -211,8 +273,11 @@ async def create_interview(
     """
     question_count = _validate_question_count(question_count)
 
-    resume_name, resume_data = await _read_upload(resume)
-    jd_name, jd_data = await _read_upload(jd)
+    limits = get_settings().business
+    resume_name, resume_data = await _read_upload(
+        resume, limit_mb=limits.max_file_mb, label="简历"
+    )
+    jd_name, jd_data = await _read_upload(jd, limit_mb=limits.max_file_mb, label="岗位描述")
     jd_text = jd_text.strip() if jd_text and jd_text.strip() else None
 
     if resume_name is None:
@@ -227,7 +292,6 @@ async def create_interview(
     _quick_validate(resume_name, resume_data, "简历")
     if jd_name is not None:
         _quick_validate(jd_name, jd_data, "岗位描述")
-
     session = sessions_repo.create(db, owner_id=visitor.id, question_count=question_count)
     db.commit()
 
@@ -262,10 +326,10 @@ def get_interview(
 ) -> dict:
     session = _owned_session(db, session_id, visitor)
 
-    if session.status == "PREPARING" and session_id not in _preparing:
-        # 进程重启导致准备任务孤儿化：如实标记失败，让用户重新上传（§10）
+    if session.status == "PREPARING" and _is_orphan_preparing(session, session_id):
+        # 进程重启/任务丢失导致准备任务孤儿化：如实标记失败，让用户重新上传（§10）
         sessions_repo.mark_preparation_failed(
-            db, session, "准备过程被服务重启中断，请重新上传材料"
+            db, session, "准备过程被服务重启或中断，请重新上传材料"
         )
         db.commit()
         db.refresh(session)

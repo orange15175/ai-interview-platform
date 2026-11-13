@@ -73,6 +73,24 @@ def _validation_error_handler(request: Request, exc: RequestValidationError) -> 
     )
 
 
+def _unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    """兜底 500：不接的话 FastAPI 返回纯文本，前端 res.json() 解析失败。
+
+    对外只给稳定 code + 人话，堆栈只进日志（绝不回传给客户端）。
+    retryable=True：这类错误多数是瞬时故障，允许前端用同一个 request_id 重试
+    （幂等由后端保证，不会重复计分）。
+    """
+    log.exception("未捕获异常 %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "code": "INTERNAL_ERROR",
+            "message": "服务内部错误，请稍后重试",
+            "retryable": True,
+        },
+    )
+
+
 def create_app() -> FastAPI:
     app = FastAPI(
         title="AI 模拟面试系统",
@@ -97,6 +115,9 @@ def create_app() -> FastAPI:
 
     app.add_exception_handler(AppError, _app_error_handler)
     app.add_exception_handler(RequestValidationError, _validation_error_handler)
+    # 兜底：Starlette 对 Exception 的处理器只在 ServerErrorMiddleware 里生效，
+    # 仍会记录日志并返回这里给的结构
+    app.add_exception_handler(Exception, _unhandled_error_handler)
     return app
 
 

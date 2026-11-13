@@ -28,6 +28,11 @@ class Base(DeclarativeBase):
     type_annotation_map = {
         # 业务 JSON 字段在 PG 上是 JSONB，SQLite（测试）退回 JSON
         dict: JSON().with_variant(JSONB(), "postgresql"),
+        # 时间列必须是 timestamptz。写成 timestamp without time zone 时，
+        # psycopg 会把带时区的 UTC 值先转成**数据库会话时区**（本机是
+        # Asia/Shanghai）再丢掉时区，读回来是 naive 且偏移 8 小时——
+        # 所有"与当前时间比较"的逻辑（TTL、超时、孤儿判定）都会错。
+        datetime: DateTime(timezone=True),
     }
 
 

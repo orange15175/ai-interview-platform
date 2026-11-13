@@ -16,12 +16,13 @@ from __future__ import annotations
 
 import io
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from docx import Document
 from fastapi.testclient import TestClient
 from sqlalchemy import delete as sa_delete
-from sqlalchemy import select
+from sqlalchemy import select, update as sa_update
 
 from app.api import interviews as interviews_api
 from app.infrastructure.checkpoint import get_checkpointer
@@ -338,15 +339,30 @@ def test_current_question_recovers_after_checkpoint_loss(client):
 
 
 def test_orphan_preparing_session_marked_failed(client, monkeypatch):
-    """进程重启会丢掉 _preparing 登记表：轮询必须把孤儿会话收口成失败。"""
+    """重启留下的 PREPARING 会话，轮询必须收口成失败，不能永远转圈。
+
+    判定口径是"创建时间早于本进程启动"——这比"不在我的登记表里"可靠：
+    多 worker 部署时，别的 worker 正在准备的会话不在本进程登记表里，
+    直接判死会把它误杀（该任务随后发现状态已变，静默跳过 → 永久失败）。
+    """
     monkeypatch.setattr(interviews_api, "_run_preparation", lambda **kwargs: None)
     sid = _create_interview(client, count="2").json()["session_id"]
 
     # 还在登记表里：如实返回 PREPARING
     assert client.get(f"/api/interviews/{sid}").json()["status"] == "PREPARING"
 
-    # 模拟重启：登记表清空
-    interviews_api._preparing.clear()
+    # 模拟真实重启：登记表空了，且这份会话是上一个进程创建的
+    interviews_api._preparing.discard(sid)
+    db = get_session_factory()()
+    try:
+        db.execute(
+            sa_update(InterviewSession)
+            .where(InterviewSession.id == uuid.UUID(sid))
+            .values(created_at=datetime.now(timezone.utc) - timedelta(hours=1))
+        )
+        db.commit()
+    finally:
+        db.close()
 
     view = client.get(f"/api/interviews/{sid}").json()
     assert view["status"] == "PREPARATION_FAILED"
@@ -355,6 +371,36 @@ def test_orphan_preparing_session_marked_failed(client, monkeypatch):
     # 终态：当前题接口返回 finished 事实
     cq = client.get(f"/api/interviews/{sid}/current-question").json()
     assert cq["finished"] is True
+
+
+def test_preparing_session_is_not_killed_while_other_worker_may_run_it(client, monkeypatch):
+    """本进程创建、登记表却没有的会话：超时前不能判孤儿（可能是别的 worker 在跑）。"""
+    monkeypatch.setattr(interviews_api, "_run_preparation", lambda **kwargs: None)
+    sid = _create_interview(client, count="2").json()["session_id"]
+
+    # 模拟"登记表在别的 worker 上"：本进程登记表里没有它
+    interviews_api._preparing.discard(sid)
+
+    # 刚创建、还在准备超时窗口内 → 必须继续如实返回 PREPARING
+    assert client.get(f"/api/interviews/{sid}").json()["status"] == "PREPARING"
+
+    # 超过准备超时（任务多半真的丢了）→ 才允许判孤儿
+    monkeypatch.setattr(interviews_api, "_PREPARATION_TIMEOUT_SECONDS", -1)
+    assert client.get(f"/api/interviews/{sid}").json()["status"] == "PREPARATION_FAILED"
+
+
+def test_oversized_upload_rejected_at_once(client):
+    """超限文件必须当场拒绝：不能先整个读进内存再报错（那样能被内存炸弹打挂）。"""
+    big = b"\x00" * (11 * 1024 * 1024)  # 默认上限 10 MiB
+    r = client.post(
+        "/api/interviews",
+        files={"resume": ("resume.docx", big, DOCX_MIME)},
+        data={"question_count": "2"},
+    )
+    assert r.status_code == 422
+    body = r.json()
+    assert body["code"] == "FILE_TOO_LARGE"
+    assert "上限" in body["message"]
 
 
 def test_invalid_file_rejected_immediately(client):

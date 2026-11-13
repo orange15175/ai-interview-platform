@@ -66,3 +66,47 @@
 安全隐患（需用户处理）
 - 两个真实 key 在 backend/.env（不入库）；.env.example 已还原占位模板。
 - DeepSeek key 曾在聊天截图出现，建议平台撤销重建。
+
+阶段 5 后续巡检与修复（2026-11-13 20:31-21:00，136 测试）
+起因：用户要求"检测一下有没有什么问题"。逐项检查（服务/测试/迁移/密钥/错误处理/时间口径）
+后共修 7 处，其中 2 处是潜伏已久、影响正确性的真问题。
+
+体检发现的环境问题（已恢复）
+- Docker 容器被关掉（ai-interview-postgres / ai-interview-redis 均 Exited），PG/Redis 全挂。
+  docker compose up -d 已恢复；后端连接池 pool_pre_ping 生效，进程无需重启即自愈。
+
+修掉的问题
+1. 【真问题·时间口径】所有时间列是 timestamp without time zone。psycopg 写入带时区的
+   UTC 时会先转成数据库会话时区（Asia/Shanghai）再丢时区，读回 naive 且偏 8 小时。
+   后果：访客/会话 TTL 判断宽松 8 小时；准备超时/孤儿判定完全失效（age 恒为 -8h）。
+   修复：Base.type_annotation_map 把 datetime 映射为 DateTime(timezone=True)，迁移
+   9430346a7188 将 10 个列改为 timestamptz；孤儿判定统一按带时区 UTC 比较。
+2. 【真问题·内存炸弹】上传用 await file.read() 先整体读入内存再校验 10MiB 上限。
+   修复：分块读（256KiB/片），累计超限立刻抛 FILE_TOO_LARGE 停止读取。
+3. 健康检查永远 200 + status:"ok"（PG/Redis 全挂时依然报绿灯，负载均衡继续打流量）。
+   修复：组件不全可用 → 503 + status:"degraded" + unavailable 列表；另加 /api/health/live
+   存活探针（不查依赖，避免数据库抖动触发容器重启）。
+4. 未捕获异常返回 FastAPI 默认纯文本，前端 res.json() 解析失败只能显示 HTTP_500。
+   修复：Exception 处理器统一返回 {code:INTERNAL_ERROR, message, retryable:true}，
+   堆栈只进日志。
+5. 孤儿 PREPARING 判定依赖进程内 _preparing 集合：多 worker 下会把别的 worker 正在
+   准备的会话误标失败（该任务随后发现状态已变会静默跳过 → 会话永久失败）。
+   修复：created_at 早于本进程启动 → 立即判孤儿；否则需超过 180s 超时才判。
+6. 前端 fetch 用 credentials:'same-origin'：配 VITE_API_BASE 跨域部署时不带 Cookie，
+   每个请求都新建访客、记录全丢且不报错。修复：改 'include'。
+7. 前端刷新恢复时把 PREPARATION_FAILED 当"面试已结束"，用户看到 0 条记录的空结束页。
+   修复：识别该状态 → 清 localStorage、回上传页并显示失败原因。
+8. vite 默认只绑 localhost(::1)，127.0.0.1:5173 打不开、手机联调也进不去。
+   修复：host: true（0.0.0.0 + :: 双栈）。
+
+验证
+- pytest tests：136 passed（130 → +2 孤儿口径 +3 健康检查/500 契约 +1 上传超限）。
+- alembic check：无漂移；current = 9430346a7188。
+- 真实双模型端到端（经 vite 代理，2 题）：404 仍下发 Cookie → 202 → 准备 26s →
+  两题真实评分 34/34 分 → finish → records=2 → created_at 带时区且与 now 偏差 37s
+  → 跨访客 404，全过。
+- 前端 tsc --noEmit 通过、vite build 通过；5173 双栈监听，两种地址均 200。
+
+仍未做（需用户决策）
+- 接口没有频率限制：匿名接口可被反复调用刷模型额度，公网部署前必须加网关限流。
+- 单 Worker 假设：_preparing 与图缓存都是进程内的，多副本需外部存储/粘性会话。
