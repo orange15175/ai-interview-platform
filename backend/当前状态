@@ -1,0 +1,68 @@
+项目当前状态（2026-11-13 20:10）
+
+定位：按《AI面试系统开发说明》（D:\Desktop\AI面试系统开发说明.md）执行五阶段改造。
+阶段 1-5 全部完成；五阶段改造收口。后续为按需迭代。
+
+本次改造范围
+- 原位修改 J:/develope/ai面试（python）/backend 与 J:/develope/ai面试-前端。
+- 双模型：解析用 qwen3.8-omni-flash（千问 MaaS，OpenAI 兼容，modalities=["text"]）；
+  出题/评分/追问用 deepseek-chat。两套配置独立（TEXT_* / VISION_*）。
+
+阶段 5 已完成（2026-11-13 19:00-20:10，130 测试 + 真机 15 项验收全过）
+- API 层 app/api/interviews.py，§10 的 6 个接口全部落地：
+  · POST /api/interviews：multipart 上传（简历必填，JD 文件/文字二选一），快速校验
+    （大小/扩展名/魔数）在 202 前给出，解析+出题在进程内后台任务执行；
+  · GET  /{id}：准备进度/可恢复性（只读）；孤儿检测：进程重启导致 _preparing 登记表
+    丢失，轮询时把 PREPARING 会话如实标成 PREPARATION_FAILED（不宣称持久任务队列）；
+  · GET  /{id}/current-question：只取当前题不推进；checkpoint 丢失时自动调
+    recover_session 从 PG 重建到安全等待点（前端"刷新"即恢复）；
+  · POST /{id}/answers：AnswerIn 校验（空回答拒绝、长度上限、跳过互斥）后走
+    interview_workflow 八步编排；
+  · POST /{id}/finish：用户提前结束，幂等（终态重复调用返回同一事实）；
+  · GET  /{id}/records：正式问答记录，剔 evaluation_rubric，不生成报告。
+- main.py：AppError → JSON{code,message,retryable} 统一映射；请求体校验 → INVALID_REQUEST；
+  开发期 CORS（ALLOWED_ORIGINS）。
+- **踩坑修复（重要）**：依赖里 response.set_cookie 设置的头会被异常处理器新建的
+  JSONResponse 静默丢弃——首次访客的第一个请求恰好失败（404/422）就永远拿不到身份，
+  之后每个请求都变成新访客。修复：get_visitor 只把 Set-Cookie 登记到 request.state，
+  由纯 ASGI 中间件 PendingCookieMiddleware 盖到最终响应（含错误响应）。有回归测试。
+- graph_runtime 自愈：checkpointer 单例被 reset 后，get_compiled_graph 发现图缓存里
+  的 saver 与单例失联会自动重建（否则跨实例 _key_registry 不通，get_state 会炸）。
+- 前端 J:/develope/ai面试-前端 原位改造：
+  · vite.config.ts：/api 同源代理到 8000（生产用 Nginx 反代，代码不改）；
+  · src/api.ts：契约类型 + RequestFailed{code,message,retryable} 封装；
+  · src/App.tsx 状态机：上传（简历+可选JD+题数）→ 准备中轮询 → 逐题作答
+    （追问徽标/跳过/Ctrl+Enter/字数统计）→ 反馈卡 → 结束页 records（平均分、
+    可展开问答）；刷新恢复（localStorage 存 session_id）+ 错误分支：
+    可重试保留同一 request_id；STALE/RECOVERY 刷新当前题；Cookie 丢失如实重来。
+- 遗留原型已删除（快照在 git 6dd88c1）：app/server.py、app/state.py、app/config.py、
+  app/schemas.py、app/graph/legacy.py、run_cli.py、app/material_parser.py（含 pypdf 依赖）。
+- backend/README.md：启动方式 / API 一览 / 可靠性边界（如实声明非 exactly-once）/
+  隐私安全 / 已知限制。
+
+验证结果
+- pytest tests：130 passed（+13 API 契约 +1 Cookie 回归；测试自清理，五表 0 残留）。
+- 冒烟（经 vite 代理，mock）：Cookie 下发/轮询/作答至结束/finish 幂等/records/隔离 全过。
+- scripts/verify_phase5_real.py（真实双模型，HTTP 全链路）15 项 PASS：
+  真实 qwen 解析 → deepseek 出 3 题（题目与简历强相关）→ 真实评分（跑题回答 19 分，
+  对题回答 47 分，评分有效）→ 中途删 checkpoint 自动恢复到追问 1 → 恢复后继续作答 →
+  finish 幂等 → records 完整无泄题 → 跨访客 404。脚本结束自动清理。
+
+运行方式
+- 后端：cd backend && ..\.venv\Scripts\python.exe -m uvicorn app.main:app --port 8000
+- 前端：cd J:\develope\ai面试-前端 && npm run dev → http://localhost:5173
+- 接口文档：http://127.0.0.1:8000/docs
+- 全量测试：..\.venv\Scripts\python.exe -m pytest tests -q
+- 真机验收：scripts\verify_phase4_real.py（并发/幂等/恢复）、scripts\verify_phase5_real.py（HTTP+双模型）
+- 注意：本机 shell 有 http_proxy=127.0.0.1:61508 且 no_proxy 为空，用 curl/脚本打
+  127.0.0.1 接口时需设 no_proxy="127.0.0.1,localhost"；浏览器访问 localhost 不受影响。
+
+未验证 / 待用户确认
+- 移动端浏览器与生产 HTTPS（COOKIE_SECURE=1）未实测。
+- 提交后修改答案策略未开放（首期一题一次，§7 口径待用户拍板）。
+- 正式记录留存/删除策略（清理任务与删除接口）待产品决策。
+- 桌面端真实浏览器点检：服务已在后台运行，可直接打开 http://localhost:5173 体验。
+
+安全隐患（需用户处理）
+- 两个真实 key 在 backend/.env（不入库）；.env.example 已还原占位模板。
+- DeepSeek key 曾在聊天截图出现，建议平台撤销重建。
