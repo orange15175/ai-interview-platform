@@ -25,11 +25,18 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, UploadFile
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session as OrmSession
 
-from app.api.deps import get_db, get_graph, get_redis_client, get_visitor, require_same_origin
+from app.api.deps import (
+    get_current_user,
+    get_db,
+    get_graph,
+    get_redis_client,
+    get_visitor,
+    require_same_origin,
+)
 from app.core.config import get_settings
 from app.core.errors import AppError
 from app.core.logging import get_logger
-from app.models import AnonymousVisitor
+from app.models import AnonymousVisitor, User
 from app.parsers.files import validate_upload
 from app.parsers.pipeline import build_parsed_input
 from app.repositories import answers as answers_repo
@@ -110,9 +117,15 @@ class AnswerIn(BaseModel):
 
 
 def _owned_session(
-    db: OrmSession, session_id: str, visitor: AnonymousVisitor
+    db: OrmSession,
+    session_id: str,
+    visitor: AnonymousVisitor,
+    user: User | None = None,
 ):
-    return sessions_repo.get_owned(db, session_id, visitor.id)
+    """归属校验：匿名访客本人，或该会话绑定的登录账号。"""
+    return sessions_repo.get_owned(
+        db, session_id, visitor.id, user_id=user.id if user else None
+    )
 
 
 def _validate_question_count(count: int | None) -> int | None:
@@ -264,6 +277,7 @@ async def create_interview(
     jd_text: str | None = Form(None, description="岗位描述文字（可选，与 jd 文件互斥）"),
     question_count: int | None = Form(None, description="题目数量（默认 15）"),
     visitor: AnonymousVisitor = Depends(get_visitor),
+    user: User | None = Depends(get_current_user),
     db: OrmSession = Depends(get_db),
 ) -> dict:
     """202 + session_id：创建较快，准备结果靠轮询 GET /api/interviews/{id}。
@@ -292,7 +306,12 @@ async def create_interview(
     _quick_validate(resume_name, resume_data, "简历")
     if jd_name is not None:
         _quick_validate(jd_name, jd_data, "岗位描述")
-    session = sessions_repo.create(db, owner_id=visitor.id, question_count=question_count)
+    session = sessions_repo.create(
+        db,
+        owner_id=visitor.id,
+        question_count=question_count,
+        user_id=user.id if user else None,
+    )
     db.commit()
 
     sid = str(session.id)
@@ -321,10 +340,11 @@ async def create_interview(
 def get_interview(
     session_id: str,
     visitor: AnonymousVisitor = Depends(get_visitor),
+    user: User | None = Depends(get_current_user),
     db: OrmSession = Depends(get_db),
     graph=Depends(get_graph),
 ) -> dict:
-    session = _owned_session(db, session_id, visitor)
+    session = _owned_session(db, session_id, visitor, user)
 
     if session.status == "PREPARING" and _is_orphan_preparing(session, session_id):
         # 进程重启/任务丢失导致准备任务孤儿化：如实标记失败，让用户重新上传（§10）
@@ -355,10 +375,11 @@ def get_interview(
 def get_current_question(
     session_id: str,
     visitor: AnonymousVisitor = Depends(get_visitor),
+    user: User | None = Depends(get_current_user),
     db: OrmSession = Depends(get_db),
     graph=Depends(get_graph),
 ) -> dict:
-    session = _owned_session(db, session_id, visitor)
+    session = _owned_session(db, session_id, visitor, user)
 
     if session.status == "PREPARING":
         raise AppError(
@@ -418,6 +439,7 @@ def submit_answer(
     session_id: str,
     body: AnswerIn,
     visitor: AnonymousVisitor = Depends(get_visitor),
+    user: User | None = Depends(get_current_user),
     db: OrmSession = Depends(get_db),
     graph=Depends(get_graph),
     redis_client=Depends(get_redis_client),
@@ -445,6 +467,7 @@ def submit_answer(
         answer=None if skipped else body.answer,
         skipped=skipped,
         expected_state_version=body.expected_state_version,
+        user_id=user.id if user else None,
         redis_client=redis_client,
     )
 
@@ -457,9 +480,10 @@ def submit_answer(
 def finish_interview(
     session_id: str,
     visitor: AnonymousVisitor = Depends(get_visitor),
+    user: User | None = Depends(get_current_user),
     db: OrmSession = Depends(get_db),
 ) -> dict:
-    session = _owned_session(db, session_id, visitor)
+    session = _owned_session(db, session_id, visitor, user)
 
     if session.status == "PREPARING":
         # 准备还在进行：后台任务随后会把状态收口，这里不允许半路截断
@@ -516,10 +540,11 @@ def finish_interview(
 def get_records(
     session_id: str,
     visitor: AnonymousVisitor = Depends(get_visitor),
+    user: User | None = Depends(get_current_user),
     db: OrmSession = Depends(get_db),
 ) -> dict:
     """已完成的问答记录。不包含内部评分要点（rubric），也不做总结报告。"""
-    session = _owned_session(db, session_id, visitor)
+    session = _owned_session(db, session_id, visitor, user)
 
     questions = questions_repo.list_for_session(db, session.id)
     by_question = {a.question_id: a for a in answers_repo.list_for_session(db, session.id)}

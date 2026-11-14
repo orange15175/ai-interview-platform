@@ -29,6 +29,10 @@ python -m venv ../.venv && ../.venv/Scripts/pip install -r requirements.txt
 
 | 接口 | 作用 |
 | --- | --- |
+| POST /api/auth/register | 注册（账号唯一）并直接登录，201 |
+| POST /api/auth/login | 账号 + 密码登录 |
+| POST /api/auth/logout | 登出（清 Cookie，幂等） |
+| GET /api/auth/me | 当前登录用户；未登录返回 `{"user": null}`（不报 401） |
 | POST /api/interviews | multipart 上传简历(+可选JD)，202+session_id，后台解析出题 |
 | GET /api/interviews/{id} | 轮询准备进度/进度/可恢复性（只读） |
 | GET /api/interviews/{id}/current-question | 当前题；checkpoint 丢失时自动从 PG 重建 |
@@ -41,10 +45,25 @@ python -m venv ../.venv && ../.venv/Scripts/pip install -r requirements.txt
 错误统一 `{code, message, retryable}`；稳定错误码见 `app/core/errors.py`。
 未捕获异常也走同一契约（`INTERNAL_ERROR`，堆栈只进日志）。
 
+## 账号与登录（首期）
+
+- **账号唯一**：`users.account` 有唯一约束 `uq_users_account`，并发注册也只会成功一个；
+  账号统一小写存储，`Alice` 与 `alice` 是同一个账号。
+- **密码**：PBKDF2-HMAC-SHA256（600k 迭代 + 随机盐），明文永不入库、永不进日志；
+  校验走恒定时间比较。策略：8~128 位，不能纯数字/纯字母。
+- **登录态**：`aiiv_user` Cookie，值为 `uid.exp.HMAC-SHA256` 签名串（HttpOnly / SameSite=Lax /
+  生产 `COOKIE_SECURE=1`）。无状态，服务端不存会话表；登出即清 Cookie。
+- **必须配 `AUTH_SECRET`**（`.env`）：不配会用进程内随机值兜底，服务一重启所有人掉线。
+- **匿名流程不受影响**：不登录也能创建面试；登录后创建的会话额外记到 `interview_sessions.user_id`，
+  换浏览器重新登录仍能继续（归属校验允许"访客本人"或"会话所属账号"）。
+- 错误码：`ACCOUNT_TAKEN`(409)、`INVALID_CREDENTIALS`(401，不区分账号不存在/密码错)、
+  `AUTH_REQUIRED`(401)。
+- 未做（按首期范围）：找回密码、改密码、手机/邮箱验证、登录失败次数限制、踢下线。
+
 ## 测试与验收
 
 ```bash
-cd backend && ../.venv/Scripts/python -m pytest tests -q     # 136 passed（LLM_MOCK=1，零模型费用）
+cd backend && ../.venv/Scripts/python -m pytest tests -q     # 173 passed（LLM_MOCK=1，零模型费用）
 ../.venv/Scripts/python scripts/verify_phase4_real.py         # 并发/幂等/恢复 真机验收（真 PG+Redis）
 ../.venv/Scripts/python scripts/verify_phase5_real.py         # HTTP 全流程 + 匿名隔离 真机验收
 ```

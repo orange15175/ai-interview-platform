@@ -17,6 +17,8 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
+import time
+import uuid
 
 # 32 字节随机 → token_urlsafe 后约 43 个字符，远超暴力枚举可能
 TOKEN_BYTES = 32
@@ -53,3 +55,88 @@ def looks_like_token(token: str | None) -> bool:
     if not 20 <= len(token) <= 128:
         return False
     return not any(ch.isspace() for ch in token)
+
+
+# ---------------------------------------------------------------------------
+# 账号密码（注册 / 登录）
+# ---------------------------------------------------------------------------
+#
+# 为什么用 PBKDF2 而不是 bcrypt/argon2：
+# 标准库直接有，不引入新依赖（部署面越小越好），PBKDF2-HMAC-SHA256 在
+# 600k 迭代下对"离线爆破"的代价已经足够。真要升级到 argon2 只需改这两个函数，
+# 存储格式里带算法名与迭代次数，老哈希仍可校验、可平滑迁移。
+
+PASSWORD_ALGO = "pbkdf2_sha256"
+PASSWORD_ITERATIONS = 600_000
+_SALT_BYTES = 16
+PASSWORD_MIN_LEN = 8
+PASSWORD_MAX_LEN = 128   # 上限不是安全需要，是防止超长输入把 CPU 打满
+
+
+def hash_password(password: str) -> str:
+    """明文 → `pbkdf2_sha256$迭代次数$盐$哈希`（盐随机、每次不同）。"""
+    if not isinstance(password, str) or not password:
+        raise ValueError("密码为空")
+    if len(password) > PASSWORD_MAX_LEN:
+        raise ValueError("密码过长")
+    salt = secrets.token_bytes(_SALT_BYTES)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PASSWORD_ITERATIONS)
+    return f"{PASSWORD_ALGO}${PASSWORD_ITERATIONS}${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    """校验密码。任何异常（格式坏、算法不认识）都返回 False，绝不抛错泄信息。"""
+    if not isinstance(password, str) or not password or len(password) > PASSWORD_MAX_LEN:
+        return False
+    try:
+        algo, iterations, salt_hex, digest_hex = stored.split("$")
+        if algo != PASSWORD_ALGO:
+            return False
+        iterations_int = int(iterations)
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(digest_hex)
+    except (ValueError, AttributeError):
+        return False
+    actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations_int)
+    return hmac.compare_digest(actual, expected)  # 恒定时间，防计时侧信道
+
+
+# ---------------------------------------------------------------------------
+# 登录态令牌（无状态签名 Cookie）
+# ---------------------------------------------------------------------------
+#
+# 格式：`{user_id}.{过期时间戳}.{HMAC-SHA256 签名}`
+# - 无状态：不用为每个登录会话在 Redis/PG 建表，重启也不掉线；
+# - 签名密钥只在服务端（AUTH_SECRET），客户端改不了 uid/exp；
+# - 登出 = 清 Cookie（首期不做"踢下线"，多端共享同一令牌）。
+
+
+def issue_login_token(user_id: uuid.UUID | str, *, secret: str, ttl_hours: int) -> tuple[str, int]:
+    """签发登录令牌，返回 (令牌, 有效秒数)。"""
+    if not secret:
+        raise ValueError("AUTH_SECRET 未配置，无法签发登录令牌")
+    expires_at = int(time.time()) + max(1, ttl_hours) * 3600
+    payload = f"{user_id}.{expires_at}"
+    signature = hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{payload}.{signature}", max(1, ttl_hours) * 3600
+
+
+def parse_login_token(token: str | None, *, secret: str) -> uuid.UUID | None:
+    """校验令牌并取出 user_id；签名不对/过期/格式坏一律返回 None（当作未登录）。"""
+    if not token or not secret or not isinstance(token, str):
+        return None
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    uid_part, exp_part, signature = parts
+    payload = f"{uid_part}.{exp_part}"
+    expected = hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        return None
+    try:
+        if int(exp_part) < int(time.time()):
+            return None
+        return uuid.UUID(uid_part)
+    except (ValueError, AttributeError):
+        return None
+

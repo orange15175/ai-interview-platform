@@ -2,6 +2,7 @@
 
 路由结构：
 - /api/health        健康检查（脱敏）
+- /api/auth          账号注册 / 登录 / 登出 / 当前用户
 - /api/interviews    面试 6 个接口（阶段 5）
 
 旧原型 app/server.py 已在阶段 5 删除；历史接口契约见 git 记录。
@@ -12,6 +13,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from app.api.auth import router as auth_router
 from app.api.health import router as health_router
 from app.api.interviews import router as interviews_router
 from app.core.config import get_settings
@@ -111,6 +113,7 @@ def create_app() -> FastAPI:
         )
 
     app.include_router(health_router, prefix="/api")
+    app.include_router(auth_router, prefix="/api")
     app.include_router(interviews_router, prefix="/api")
 
     app.add_exception_handler(AppError, _app_error_handler)

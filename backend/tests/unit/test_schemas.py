@@ -3,7 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
-from app.schemas.evaluation import DimensionScores, Evaluation
+from app.schemas.evaluation import DimensionScores, Evaluation, FollowUpQuestion
 from app.schemas.materials import ParsedMaterials, ResumeProfile
 from app.schemas.questions import QuestionSet
 
@@ -101,3 +101,34 @@ def test_skills_dedup_and_empty_check():
     r = ResumeProfile(skills=["Python", "python", " FastAPI "])
     assert r.skills == ["Python", "FastAPI"]
     assert r.is_empty is True  # 只有技能、没有经历/教育/项目
+
+
+# ---------------------------------------------------------------- 追问：单问句
+
+
+def test_two_clause_followup_collapsed_into_one_question():
+    """实测模型常写"确认句？真问题？"：要收束成一个问号，且不丢内容。"""
+    fq = FollowUpQuestion(
+        content="那在动手改之前，你有没有做过压测？QPS 从 500 到 5000 是怎么测出来的？"
+    )
+    assert fq.content.count("？") == 1
+    assert fq.content.endswith("？")
+    # 内容不能丢：两端信息都还在
+    assert "压测" in fq.content and "5000" in fq.content
+
+
+def test_ascii_question_mark_normalized():
+    fq = FollowUpQuestion(content="你说的 P99 是怎么统计的?")
+    assert fq.content.endswith("？")
+
+
+def test_followup_with_question_list_rejected():
+    """罗列一串问题（4 个以上问号）不是追问，宁可重试。"""
+    with pytest.raises(ValidationError, match="过多问句"):
+        FollowUpQuestion(content="为什么用 Redis？为什么不用本地缓存？压测怎么做的？数据可靠吗？")
+
+
+def test_collapse_does_not_produce_broken_punctuation():
+    fq = FollowUpQuestion(content="你提到 QPS 提到 5000？那这个数是压测还是线上真实流量？")
+    assert "，？" not in fq.content and "，，" not in fq.content
+    assert fq.content == "你提到 QPS 提到 5000，那这个数是压测还是线上真实流量？"

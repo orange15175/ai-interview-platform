@@ -9,10 +9,12 @@ from app.models.tables import (
     InterviewMaterial,
     InterviewQuestion,
     InterviewSession,
+    User,
 )
 
 __all__ = [
     "Base",
+    "User",
     "AnonymousVisitor",
     "InterviewSession",
     "InterviewQuestion",

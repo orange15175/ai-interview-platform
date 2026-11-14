@@ -84,6 +84,33 @@ class Evaluation(BaseModel):
         })
 
 
+_QUESTION_MARKS = ("？", "?")
+
+
+def to_single_question(text: str) -> str:
+    """把"一句确认 + 一句真问题"收束成一个问句（无损，一个问号结尾）。
+
+    真实模型很爱这么写：「那改之前你有没有压过测？QPS 500→5000 是怎么测出来的？」
+    这是两个问句。早先的实现直接判非法，结果**整条追问被丢弃**（退化成没有追问），
+    实测两次追问全部这样挂掉。所以这里不删内容，只把中间的问号改成分句逗号——
+    意思一字不少，但对外只有一个问号，答题人面对的就是一个问题。
+    """
+    v = (text or "").strip()
+    marks = [i for i, ch in enumerate(v) if ch in _QUESTION_MARKS]
+    if len(marks) <= 1:
+        return v.replace("?", "？")
+
+    out: list[str] = []
+    last = marks[-1]
+    for i, ch in enumerate(v):
+        if ch in _QUESTION_MARKS:
+            out.append("？" if i == last else "，")
+        else:
+            out.append(ch)
+    joined = "".join(out)
+    return joined.replace("，？", "？").replace("，，", "，").strip()
+
+
 class FollowUpQuestion(BaseModel):
     """追问 Agent 的输出：只一个问题，不泄露答案、不换话题。"""
 
@@ -93,6 +120,10 @@ class FollowUpQuestion(BaseModel):
     @classmethod
     def _single_question(cls, v: str) -> str:
         v = v.strip()
-        if v.count("？") + v.count("?") > 1:
-            raise ValueError("追问必须只包含一个问题")
+        if v.count("？") + v.count("?") > 3:
+            # 超过 3 个问句：模型在罗列问题清单，不是追问，宁可重试
+            raise ValueError("追问包含过多问句，请只问一个问题")
+        v = to_single_question(v)
+        if len(v) < 8:
+            raise ValueError("追问内容过短")
         return v

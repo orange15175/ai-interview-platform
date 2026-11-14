@@ -22,10 +22,12 @@ from fastapi import Depends, Request, Response
 from sqlalchemy.orm import Session as OrmSession
 
 from app.core.config import get_settings
-from app.core.errors import CsrfRejectedError
+from app.core.errors import AuthRequiredError, CsrfRejectedError
 from app.core.logging import get_logger
+from app.core.security import parse_login_token
 from app.infrastructure.db import get_session_factory
-from app.models import AnonymousVisitor
+from app.models import AnonymousVisitor, User
+from app.repositories import users as users_repo
 from app.repositories import visitors as visitors_repo
 
 log = get_logger(__name__)
@@ -127,3 +129,27 @@ def get_redis_client():
     from app.infrastructure.redis_client import get_redis
 
     return get_redis()
+
+
+def get_current_user(
+    request: Request,
+    db: OrmSession = Depends(get_db),
+) -> User | None:
+    """当前登录用户；未登录/令牌过期/签名不对一律返回 None（当作游客）。
+
+    刻意不在这里抛 401：绝大多数接口（创建面试、答题）匿名也能用，
+    只有真正需要账号的接口才用 require_user 强制登录。
+    """
+    settings = get_settings()
+    token = request.cookies.get(settings.auth_cookie_name)
+    user_id = parse_login_token(token, secret=settings.auth_secret)
+    if user_id is None:
+        return None
+    return users_repo.get(db, user_id)
+
+
+def require_user(user: User | None = Depends(get_current_user)) -> User:
+    """强制登录的依赖（留给"我的面试记录"这类接口用）。"""
+    if user is None:
+        raise AuthRequiredError()
+    return user

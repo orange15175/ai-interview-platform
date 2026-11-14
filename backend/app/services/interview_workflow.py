@@ -203,13 +203,18 @@ def submit_answer(
     answer: str | None = None,
     skipped: bool = False,
     expected_state_version: int | None = None,
+    user_id: uuid.UUID | str | None = None,
     redis_client=None,
 ) -> dict:
-    """提交一次回答（或跳过），推进到下一题或结束。"""
+    """提交一次回答（或跳过），推进到下一题或结束。
+
+    user_id：登录用户身份（可选）。带上它就允许"换浏览器重新登录后继续答"，
+    不带则只认匿名访客 Cookie，行为与之前完全一致。
+    """
     if not request_id or len(request_id) > 64:
         raise RequestConflictError("request_id 缺失或过长（<=64 字符）")
 
-    session = sessions_repo.get_owned(db, session_id, owner_id)
+    session = sessions_repo.get_owned(db, session_id, owner_id, user_id=user_id)
     sessions_repo.assert_can_answer(session)
 
     question = questions_repo.get(db, question_id)

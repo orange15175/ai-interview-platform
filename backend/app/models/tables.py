@@ -27,6 +27,31 @@ from app.models.base import JSONVar
 from app.models.base import Base, utcnow
 
 # ---------------------------------------------------------------------------
+# 注册用户（账号 + 密码）
+# ---------------------------------------------------------------------------
+
+
+class User(Base):
+    """账号密码用户。首期只做"账号唯一 + 密码登录"，不做手机/邮箱/找回。
+
+    - account 统一小写后存储：登录大小写不敏感，唯一约束才真正等于"账号唯一"；
+    - password_hash 存 PBKDF2-SHA256（含盐与迭代次数），明文密码永不入库、永不进日志。
+    """
+
+    __tablename__ = "users"
+    __table_args__ = (
+        # 显式命名：唯一约束要能在迁移里稳定地加/删
+        UniqueConstraint("account", name="uq_users_account"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    account: Mapped[str] = mapped_column(String(64), index=True)
+    password_hash: Mapped[str] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    last_login_at: Mapped[datetime | None] = mapped_column(nullable=True)
+
+
+# ---------------------------------------------------------------------------
 # 匿名访客（开发说明 §8 anonymous_visitors）
 # ---------------------------------------------------------------------------
 
@@ -64,6 +89,11 @@ class InterviewSession(Base):
     # 归属校验：所有查询都必须 join owner，防止跨访客读取（§11）
     owner_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("anonymous_visitors.id", ondelete="CASCADE"), index=True
+    )
+    # 可选：登录状态下创建的会话同时记到账号名下。
+    # 这样换浏览器/清 Cookie 后重新登录仍能找回，匿名访客流程保持原样（可为空）。
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
     )
     status: Mapped[str] = mapped_column(String(32), default="PREPARING", index=True)
     question_count: Mapped[int] = mapped_column(Integer, default=15)

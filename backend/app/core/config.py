@@ -10,6 +10,8 @@
 """
 
 import os
+import secrets
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -23,6 +25,30 @@ load_dotenv(ENV_PATH, override=False)  # 已存在的进程环境变量优先，
 def _env(key: str, default: str = "") -> str:
     """读环境变量并去掉首尾空白；空串表示未配置。"""
     return os.getenv(key, default).strip()
+
+
+# ---------------------------------------------------------------------------
+# 登录令牌签名密钥的兜底值
+# ---------------------------------------------------------------------------
+
+# 进程内生成一次：保证同一进程内多次 get_settings() 得到同一个密钥，
+# 否则每次调用都换密钥，登录令牌立刻失效。进程重启后变化是预期行为
+# （.env 里配了 AUTH_SECRET 就不会有这个问题）。
+_EPHEMERAL_AUTH_SECRET = secrets.token_hex(32)
+_warned_ephemeral = False
+
+
+def _ephemeral_auth_secret() -> str:
+    global _warned_ephemeral
+    if not _warned_ephemeral:
+        _warned_ephemeral = True
+        warnings.warn(
+            "未配置 AUTH_SECRET，已使用进程内随机密钥：服务重启后所有登录态失效。"
+            "生产环境必须在 .env 里设置 AUTH_SECRET。",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return _EPHEMERAL_AUTH_SECRET
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +155,12 @@ class Settings:
     env_name: str = field(default_factory=lambda: _env("APP_ENV") or "dev")
     # 匿名访客 Cookie 名；生产环境必须 Secure + SameSite=Lax（§11）
     visitor_cookie_name: str = field(default_factory=lambda: _env("VISITOR_COOKIE_NAME") or "aiiv_visitor")
+    # 登录态 Cookie 名与有效期（默认 7 天）
+    auth_cookie_name: str = field(default_factory=lambda: _env("AUTH_COOKIE_NAME") or "aiiv_user")
+    auth_ttl_hours: int = field(default_factory=lambda: int(_env("AUTH_TTL_HOURS", "168") or 168))
+    # 登录令牌的签名密钥：只放服务端进程与 .env，绝不进前端/日志。
+    # 未配置时用进程内随机值兜底（开发可用，但重启后所有人掉线）。
+    auth_secret: str = field(default_factory=lambda: _env("AUTH_SECRET") or _ephemeral_auth_secret())
     cookie_secure: bool = field(default_factory=lambda: _env("COOKIE_SECURE", "0") == "1")
     # 允许跨源写请求的前端地址（本地开发前端 5173 → 后端 8000）；生产同源代理可留空
     allowed_origins: str = field(default_factory=lambda: _env("ALLOWED_ORIGINS"))

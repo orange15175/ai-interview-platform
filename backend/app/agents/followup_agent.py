@@ -32,7 +32,8 @@ SYSTEM_PROMPT = """你是资深技术面试官，正在面试中做追问。候�
 2. 口语化，像真人面试官，不要写"请回答以下问题"这类套话。
 3. 优先问事实和细节（数字、过程、取舍、踩坑），不要问"你觉得呢"这种空泛问题。
 4. 绝对不要重复「已问过的问题」列表里的任何内容，也不要与之高度相似。
-5. 不要泄露任何评分标准或理想答案，不要说"评分要点要求你……"。"""
+5. 不要泄露任何评分标准或理想答案，不要说"评分要点要求你……"。
+6. 只写一个问句：不要先问一句"你有没有…？"再追问一句，把想深挖的点合成一句话问。"""
 
 
 def _fingerprint(text: str) -> str:
@@ -97,7 +98,11 @@ def generate_followup(
 
         try:
             data = parse_json_object(raw)
+            raw_content = str(data.get("content") or "")
             fq = FollowUpQuestion.model_validate(data)
+            if fq.content != raw_content.strip():
+                # 契约会把"确认句？真问题？"收束成一句，留痕便于观察模型习惯
+                log.info("追问已收束为单问句: %s", fq.content[:120])
             if _fingerprint(fq.content) in asked_fps:
                 raise ValueError("生成的追问与已问问题重复")
             return fq

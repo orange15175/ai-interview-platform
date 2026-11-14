@@ -14,7 +14,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session as OrmSession
 
 from app.core.config import get_settings
@@ -34,12 +34,23 @@ def _as_utc(dt: datetime | None) -> datetime | None:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
-def create(db: OrmSession, *, owner_id: uuid.UUID, question_count: int | None = None) -> InterviewSession:
-    """创建会话（状态 PREPARING，等解析/出题完成才置 READY）。"""
+def create(
+    db: OrmSession,
+    *,
+    owner_id: uuid.UUID,
+    question_count: int | None = None,
+    user_id: uuid.UUID | None = None,
+) -> InterviewSession:
+    """创建会话（状态 PREPARING，等解析/出题完成才置 READY）。
+
+    user_id 只在"创建时已登录"的情况下写入：这样换浏览器重新登录还能找回
+    这场面试；匿名创建仍是 None，与旧行为完全一致。
+    """
     count = question_count if question_count is not None else get_settings().business.question_count
     session = InterviewSession(
         id=uuid.uuid4(),
         owner_id=owner_id,
+        user_id=user_id,
         status="PREPARING",
         question_count=count,
         state_version=0,
@@ -54,12 +65,27 @@ def get(db: OrmSession, session_id: uuid.UUID | str) -> InterviewSession | None:
     return db.get(InterviewSession, _as_uuid(session_id))
 
 
-def get_owned(db: OrmSession, session_id: uuid.UUID | str, owner_id: uuid.UUID | str) -> InterviewSession:
-    """按归属读取；不存在与无权限合并成同一个 404，不泄露"ID 存在"。"""
+def get_owned(
+    db: OrmSession,
+    session_id: uuid.UUID | str,
+    owner_id: uuid.UUID | str,
+    *,
+    user_id: uuid.UUID | str | None = None,
+) -> InterviewSession:
+    """按归属读取；不存在与无权限合并成同一个 404，不泄露"ID 存在"。
+
+    两种合法身份：
+    - 匿名访客本人（owner_id，创建这场会话的那枚 Cookie）；
+    - 会话所属账号（user_id，登录后创建、或创建时就绑定了账号）。
+    判定写在 SQL 的 where 里，查不到直接抛错——绝不"先查出来再 if"。
+    """
     stmt = select(InterviewSession).where(
         InterviewSession.id == _as_uuid(session_id),
-        InterviewSession.owner_id == _as_uuid(owner_id),
     )
+    identities = [InterviewSession.owner_id == _as_uuid(owner_id)]
+    if user_id is not None:
+        identities.append(InterviewSession.user_id == _as_uuid(user_id))
+    stmt = stmt.where(or_(*identities))
     session = db.scalars(stmt).one_or_none()
     if session is None:
         raise SessionNotFoundError()

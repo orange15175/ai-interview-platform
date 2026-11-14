@@ -178,3 +178,42 @@ class CsrfRejectedError(AppError):
 
     def __init__(self, message: str = "请求来源校验失败"):
         super().__init__(message)
+
+
+# ---------------------------------------------------------------------------
+# 账号与登录（首期：账号唯一 + 密码登录）
+# ---------------------------------------------------------------------------
+
+
+class AccountTakenError(AppError):
+    """账号已被占用（唯一约束冲突）。"""
+
+    code = "ACCOUNT_TAKEN"
+    http_status = 409
+
+    def __init__(self, message: str = "该账号已被注册，请换一个"):
+        super().__init__(message)
+
+
+class InvalidCredentialsError(AppError):
+    """账号或密码错误。
+
+    刻意不区分"账号不存在"与"密码不对"：两种情况返回同一句人话，
+    否则这个接口就成了账号枚举器。
+    """
+
+    code = "INVALID_CREDENTIALS"
+    http_status = 401
+
+    def __init__(self, message: str = "账号或密码不正确"):
+        super().__init__(message)
+
+
+class AuthRequiredError(AppError):
+    """需要登录后才能访问（未登录 / 令牌过期 / 令牌被篡改）。"""
+
+    code = "AUTH_REQUIRED"
+    http_status = 401
+
+    def __init__(self, message: str = "请先登录"):
+        super().__init__(message)
