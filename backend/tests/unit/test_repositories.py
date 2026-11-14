@@ -10,6 +10,7 @@ from app.repositories import answers as answers_repo
 from app.repositories import materials as materials_repo
 from app.repositories import questions as questions_repo
 from app.repositories import sessions as sessions_repo
+from app.repositories import users as users_repo
 from app.repositories import visitors as visitors_repo
 from app.schemas.materials import ParsedMaterials, ResumeProfile
 from app.schemas.questions import GeneratedQuestion, RubricPoint
@@ -61,6 +62,43 @@ def test_session_ownership_is_enforced_in_sql(db_session):
         sessions_repo.get_owned(db_session, session.id, other.id)
     with pytest.raises(SessionNotFoundError):
         sessions_repo.get_owned(db_session, "not-a-uuid", owner.id)
+
+
+def test_logged_in_identity_ignores_visitor_cookie(db_session):
+    """同一浏览器 A 登出、B 登录：B 不能顺着**不变的**访客 Cookie 读到 A 的面试。
+
+    这是 or_(owner_id, user_id) 时代的真实越权：owner_id 是浏览器粒度，
+    user_id 是账号粒度，取或等于让"换账号"变成"换不了锁"。
+    """
+    browser, _ = visitors_repo.get_or_create(db_session, None)
+    alice = users_repo.create(db_session, account="alice", password="Passw0rd!")
+    bob = users_repo.create(db_session, account="bob", password="Passw0rd!")
+    db_session.commit()
+
+    session = sessions_repo.create(db_session, owner_id=browser.id, user_id=alice.id)
+    db_session.commit()
+
+    # 账号本人：同浏览器或换设备都能读到
+    assert sessions_repo.get_owned(db_session, session.id, browser.id, user_id=alice.id).id == session.id
+    # 同浏览器上的另一个账号：查不到（对外统一 404，不泄露"这 ID 存在"）
+    with pytest.raises(SessionNotFoundError):
+        sessions_repo.get_owned(db_session, session.id, browser.id, user_id=bob.id)
+
+
+def test_anonymous_cannot_read_claimed_session(db_session):
+    """A 只是退出登录（访客 Cookie 不变）：匿名身份也不能再读到已绑账号的会话。"""
+    browser, _ = visitors_repo.get_or_create(db_session, None)
+    alice = users_repo.create(db_session, account="alice2", password="Passw0rd!")
+    db_session.commit()
+
+    claimed = sessions_repo.create(db_session, owner_id=browser.id, user_id=alice.id)
+    anonymous = sessions_repo.create(db_session, owner_id=browser.id)  # user_id 为空
+    db_session.commit()
+
+    with pytest.raises(SessionNotFoundError):
+        sessions_repo.get_owned(db_session, claimed.id, browser.id)
+    # 匿名时期创建、还没被账号认领的会话，仍归这枚访客 Cookie
+    assert sessions_repo.get_owned(db_session, anonymous.id, browser.id).id == anonymous.id
 
 
 def test_state_version_is_compare_and_swap(db_session):

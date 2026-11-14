@@ -14,7 +14,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import and_, select, update
 from sqlalchemy.orm import Session as OrmSession
 
 from app.core.config import get_settings
@@ -74,18 +74,29 @@ def get_owned(
 ) -> InterviewSession:
     """按归属读取；不存在与无权限合并成同一个 404，不泄露"ID 存在"。
 
-    两种合法身份：
-    - 匿名访客本人（owner_id，创建这场会话的那枚 Cookie）；
-    - 会话所属账号（user_id，登录后创建、或创建时就绑定了账号）。
+    身份**二选一，绝不同时成立**：
+    - 已登录（user_id 非空）→ 只认 user_id：这场面试属于我这个账号吗？
+    - 匿名（user_id 为空）→ 只认 owner_id **且该会话没被账号认领**
+      （user_id IS NULL）：访客只能碰"还没有主人的"会话。
+
+    为什么不能"任一满足即可"（or_）：owner_id 是浏览器粒度、user_id 是账号粒度，
+    两者不同权。同一个浏览器上 A 登出、B 登录时访客 Cookie **不变**，若取或，
+    B 就能顺着 owner_id 读到 A 的全部面试（题干、简历要点、作答原文全在里面）；
+    反过来，A 只是退出登录后，匿名的 owner_id 也能读到 A 已绑账号的会话。
+    所以两边都收紧：登录态忽略 owner_id，匿名态排除已认领的会话。
+
     判定写在 SQL 的 where 里，查不到直接抛错——绝不"先查出来再 if"。
     """
+    if user_id is not None:
+        identity = InterviewSession.user_id == _as_uuid(user_id)
+    else:
+        identity = and_(
+            InterviewSession.owner_id == _as_uuid(owner_id),
+            InterviewSession.user_id.is_(None),
+        )
     stmt = select(InterviewSession).where(
         InterviewSession.id == _as_uuid(session_id),
-    )
-    identities = [InterviewSession.owner_id == _as_uuid(owner_id)]
-    if user_id is not None:
-        identities.append(InterviewSession.user_id == _as_uuid(user_id))
-    stmt = stmt.where(or_(*identities))
+    ).where(identity)
     session = db.scalars(stmt).one_or_none()
     if session is None:
         raise SessionNotFoundError()
@@ -187,13 +198,33 @@ def bump_state_version(
     return new_version
 
 
-def mark_preparation_failed(db: OrmSession, session: InterviewSession, message: str) -> None:
-    """解析/出题失败：终态 + 脱敏错误码，允许用户重新创建（不覆盖旧记录）。"""
+def mark_preparation_failed(
+    db: OrmSession,
+    session: InterviewSession,
+    message: str,
+    *,
+    stage: str | None = None,
+    error_code: str | None = None,
+) -> None:
+    """解析/出题失败：终态 + 脱敏错误码，允许用户重新创建（不覆盖旧记录）。
+
+    stage / error_code 写进 progress：用户重试时后端要能判断"材料到底存下来了
+    没有"——存在解析结果就只重跑出题，不存在才要求重新上传（§十）。
+    """
+    progress: dict[str, Any] = {
+        "stage": "PREPARATION_FAILED",
+        "sanitized_error": message[:300],
+    }
+    if stage:
+        progress["failed_stage"] = stage
+    if error_code:
+        progress["error_code"] = error_code
     touch(
         db,
         session,
         status="PREPARATION_FAILED",
         sanitized_error=message[:500],
         completion_reason="PREPARATION_FAILED",
+        progress=progress,
         finished=True,
     )

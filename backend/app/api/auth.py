@@ -20,7 +20,7 @@ import re
 from datetime import timezone
 
 from fastapi import APIRouter, Depends, Request, Response
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session as OrmSession
 
 from app.api.deps import get_current_user, get_db, require_same_origin
@@ -45,20 +45,25 @@ ACCOUNT_PATTERN = re.compile(r"^[a-z0-9_.@+-]{3,64}$")
 
 
 class RegisterRequest(BaseModel):
-    account: str = Field(min_length=3, max_length=64)
-    password: str = Field(min_length=PASSWORD_MIN_LEN, max_length=PASSWORD_MAX_LEN)
+    # 长度上限不交给 Field：pydantic 的约束错误是英文（"String should have at
+    # least 3 characters"），会盖掉下面校验器里手写的中文提示（约束先于
+    # field_validator(after) 执行）。长度统一在 ACCOUNT_PATTERN / 校验器里判。
+    account: str
+    password: str
 
     @field_validator("account")
     @classmethod
     def _account_charset(cls, v: str) -> str:
-        v = v.strip().lower()
+        v = (v or "").strip().lower()
         if not ACCOUNT_PATTERN.match(v):
-            raise ValueError("账号只能包含字母、数字和 _ . @ + -，长度 3~64")
+            raise ValueError("账号只能是 3~64 位字母、数字或 _ . @ + -")
         return v
 
     @field_validator("password")
     @classmethod
     def _password_strength(cls, v: str) -> str:
+        if len(v) > PASSWORD_MAX_LEN:
+            raise ValueError(f"密码不能超过 {PASSWORD_MAX_LEN} 位")
         if len(v) < PASSWORD_MIN_LEN:
             raise ValueError(f"密码至少 {PASSWORD_MIN_LEN} 位")
         if v.strip() != v:
@@ -69,13 +74,23 @@ class RegisterRequest(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    account: str = Field(min_length=3, max_length=64)
-    password: str = Field(min_length=1, max_length=PASSWORD_MAX_LEN)
+    # 登录不校验强度：规则可能变过，老密码必须还能登进来（判错由 verify_password 负责）
+    account: str
+    password: str
 
     @field_validator("account")
     @classmethod
     def _normalize(cls, v: str) -> str:
-        return v.strip().lower()
+        return (v or "").strip().lower()
+
+    @field_validator("password")
+    @classmethod
+    def _length(cls, v: str) -> str:
+        if not v:
+            raise ValueError("请输入密码")
+        if len(v) > PASSWORD_MAX_LEN:
+            raise ValueError("账号或密码不正确")
+        return v
 
 
 def _iso_utc(value) -> str | None:

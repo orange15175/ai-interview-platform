@@ -183,6 +183,50 @@ def test_logged_in_session_is_accessible_from_another_cookie(client):
         _cleanup(other)
 
 
+def test_other_account_on_same_browser_cannot_read(client):
+    """同一浏览器换账号：访客 Cookie 不变，但 B 读不到 A 的面试（越权回归）。"""
+    alice, bob = _account(), _account()
+    client.post("/api/auth/register", json={"account": alice, "password": PASSWORD})
+    r = client.post(
+        "/api/interviews",
+        files={"resume": ("resume.docx", _resume_docx(), DOCX_MIME)},
+        data={"question_count": "2"},
+    )
+    assert r.status_code == 202, r.text
+    sid = r.json()["session_id"]
+    assert client.get(f"/api/interviews/{sid}").status_code == 200
+
+    # 同浏览器 A 登出、B 注册登录：访客 Cookie 还留在 jar 里（这正是问题所在）
+    client.post("/api/auth/logout")
+    assert client.post(
+        "/api/auth/register", json={"account": bob, "password": PASSWORD}
+    ).status_code == 201
+    assert client.get(f"/api/interviews/{sid}").status_code == 404
+
+    # A 重新登录仍能找回
+    client.post("/api/auth/logout")
+    assert client.post(
+        "/api/auth/login", json={"account": alice, "password": PASSWORD}
+    ).status_code == 200
+    assert client.get(f"/api/interviews/{sid}").status_code == 200
+
+
+def test_anonymous_after_logout_cannot_read_claimed_session(client):
+    """退出登录后变回游客：不能再用访客 Cookie 读到已绑账号的会话。"""
+    account = _account()
+    client.post("/api/auth/register", json={"account": account, "password": PASSWORD})
+    r = client.post(
+        "/api/interviews",
+        files={"resume": ("resume.docx", _resume_docx(), DOCX_MIME)},
+        data={"question_count": "2"},
+    )
+    sid = r.json()["session_id"]
+
+    client.post("/api/auth/logout")
+    assert client.get("/api/auth/me").json()["user"] is None
+    assert client.get(f"/api/interviews/{sid}").status_code == 404
+
+
 def test_anonymous_flow_still_works(client):
     """没登录也能正常创建面试（旧流程不能被账号体系绑死）。"""
     r = client.post(

@@ -68,6 +68,9 @@ def _validation_error_handler(request: Request, exc: RequestValidationError) -> 
     first = exc.errors()[0] if exc.errors() else {}
     loc = ".".join(str(x) for x in first.get("loc", ()) if x != "body")
     msg = first.get("msg", "请求参数不合法")
+    # pydantic 会给自定义校验器的 ValueError 加 "Value error, " 前缀，
+    # 直接透出会变成"account: Value error, 账号只能包含…"，人手写的中文提示被埋掉。
+    msg = msg.removeprefix("Value error, ").removeprefix("Assertion failed, ")
     return JSONResponse(
         status_code=422,
         content={"code": "INVALID_REQUEST", "message": f"{loc}: {msg}" if loc else msg,
