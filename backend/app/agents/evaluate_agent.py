@@ -17,7 +17,7 @@ from pydantic import ValidationError
 
 from app.agents.adapters import get_text_adapter
 from app.core.config import get_settings
-from app.core.errors import ModelCallError, ModelOutputInvalidError
+from app.core.errors import ModelCallError, ModelOutputInvalidError, classify_model_exception
 from app.core.logging import get_logger
 from app.llm_utils import ModelOutputError, parse_json_object
 from app.schemas.evaluation import Evaluation
@@ -155,7 +155,7 @@ def evaluate_answer(question: dict, answer: str, *, adapter=None, max_repair: in
                                    max_tokens=2000, json_mode=True)
         except Exception as exc:  # noqa: BLE001
             log.warning("评分模型调用失败（第 %d 次）: %s", attempt + 1, type(exc).__name__)
-            raise ModelCallError("评分服务暂时不可用，请稍后重试") from exc
+            raise classify_model_exception(exc, message="评分服务暂时不可用，请稍后重试") from exc
 
         try:
             return _validate(raw, rubric)

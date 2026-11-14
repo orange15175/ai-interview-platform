@@ -189,6 +189,15 @@ class InterviewAnswer(Base):
     processing_stage: Mapped[str | None] = mapped_column(String(32), nullable=True)
     processing_attempt: Mapped[int] = mapped_column(Integer, default=0)
 
+    # 图侧对账信息（每次提交都要能回答"当时图在哪、现在图在哪"）
+    # graph_stage：WAITING_INTERRUPT / NODE_INTERRUPTED / GRAPH_FINISHED / NO_CHECKPOINT
+    # graph_wait_question_id：登记/处理时图**正在等待**的题；重试时若已变化，
+    # 说明图已经推进过，只能补写数据库，绝不能把旧回答再喂给下一题。
+    graph_stage: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    graph_wait_question_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
+    # 最近一次失败的稳定错误码（脱敏；用于恢复时区分"模型超时"与"结构非法"）
+    last_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
     # 跳过或评分未成功时为空——【不给兜底 0 分】（§7.1）
     score: Mapped[int | None] = mapped_column(Integer, nullable=True)
     evaluation: Mapped[dict | None] = mapped_column(JSONVar, nullable=True)

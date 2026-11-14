@@ -111,7 +111,7 @@
 - 接口没有频率限制：匿名接口可被反复调用刷模型额度，公网部署前必须加网关限流。
 - 单 Worker 假设：_preparing 与图缓存都是进程内的，多副本需外部存储/粘性会话。
 
-阶段 6：账号与登录（2026-11-14 14:20-14:40，173 测试）
+阶段 6：账号与登录（2026-11-14 14:20-15:05，177 测试）
 
 范围：只要"账号 + 密码"，账号唯一。未做找回密码、改密码、登录限流、踢下线。
 
@@ -137,20 +137,136 @@
 - 三个写接口都过 require_same_origin（CSRF）。
 - 密码策略：8~128 位、不能纯数字/纯字母；账号 3~64 位 [a-z0-9_.@+-]。
 
-归属兼容（repositories/sessions.py + services/interview_workflow.py）
-- get_owned 的 where 改成 `id = ? AND (owner_id = 访客 OR user_id = 登录账号)`，
-  判定仍在 SQL 里做；submit_answer 新增可选 user_id 透传。
+归属判定（repositories/sessions.py + services/interview_workflow.py）——**已修正**（2026-11-14）
+- 最初写成 `id = ? AND (owner_id = 访客 OR user_id = 登录账号)`，2026-11-14 复查发现这是
+  越权：owner_id 是浏览器粒度、user_id 是账号粒度，两者取或等于"换账号换不了锁"——
+  同一浏览器 A 登出、B 登录时访客 Cookie 不变，B 顺着 owner_id 就能读到 A 的全部面试
+  （题干、简历要点、作答原文）；反向也漏：A 仅退出登录后，匿名身份靠 owner_id 仍能读
+  自己已绑账号的会话。
+- 现行规则（身份二选一，绝不同时成立）：
+  · 已登录 → 只认 `user_id = 我`，完全忽略 owner_id；
+  · 匿名   → 只认 `owner_id = 我的访客 Cookie AND user_id IS NULL`（只能碰没被账号认领的会话）。
+- 判定仍在 SQL where 里（`and_`/单条件），查不到统一 404，不泄露"这 ID 存在"。
+  单元回归 test_repositories.py 两条 + 接口回归 test_auth_api.py 两条，四个方向都钉住。
 - 效果：登录后创建面试 → 换浏览器重新登录仍能继续答题；未登录访客仍看不到（404）。
+- 校验文案：RegisterRequest/LoginRequest 去掉 Field(min_length/…) —— pydantic 的长度
+  约束错误是英文且先于自定义校验器执行，会盖掉手写中文提示；长度/字符集统一在校验器里判，
+  main.py 的 422 处理器顺带剥掉 "Value error, " 前缀，前端拿到的就是纯中文人话。
+
+前端登录（2026-11-14 15:00，仍无"我的面试"列表页）
+- 新增 src/AuthPage.tsx：登录/注册双 Tab 单卡片，账号密码 + 注册二次确认；规则与服务端
+  完全一致的前置校验只为即时反馈（真判定仍在后端）；错误按 code 分支（INVALID_CREDENTIALS
+  → "账号或密码不正确"，ACCOUNT_TAKEN → "该账号已被注册"），不靠 HTTP 状态码猜。
+- src/App.tsx 拆成两层：App = 登录闸门（启动先问 /api/auth/me，undefined 时段显示
+  "正在确认登录状态…" 避免闪屏；null → AuthPage；有 user → Workspace）+
+  Workspace = 原匿名流程原封不动（上传/轮询/作答/记录）。
+- 登录态**不落 localStorage**：令牌是 HttpOnly Cookie，脚本读不到；localStorage 只保留
+  session_id 用于刷新恢复，且登录/登出成功时清掉（身份换了，旧会话不再属于当前账号）。
+- 页头显示当前账号 + 退出；上传页与页脚的"匿名 Cookie"文案改成账号口径
+  （"本场面试会绑定到账号 xxx，换设备登录同一账号也能找回"）。
+- tsc --noEmit 通过、vite build 通过（246 kB / gzip 77 kB）。
 
 验证
-- pytest tests：173 passed（140 → +18 认证单测/集成 + 期间其它）。
+- pytest tests：177 passed（173 → +2 越权回归 +2 单元越权回归）。
   认证覆盖：注册即登录、大小写唯一、重复注册 409、错密码/不存在账号同错、伪造签名当游客、
-  登出幂等、非法账号与弱密码 422、登录用户跨 Cookie 访问自己的会话、匿名流程仍可创建（user_id 为 NULL）。
-- 真机 HTTP 冒烟（直连 8000）：注册 201 → /me 对 → 大写重复账号 ACCOUNT_TAKEN → 登出 me=null
-  → 登录 200 → 新浏览器 me=null → 错密码 401，全部符合预期；数据已清理（users 0 行）。
-- alembic：head = f02b782ee78f，alembic check 无漂移。
+  登出幂等、非法账号与弱密码 422（中文文案）、登录用户跨 Cookie 访问自己的会话、
+  同浏览器换账号读不到、登出后匿名读不到、匿名流程仍可创建（user_id 为 NULL）。
+- 真机 HTTP 冒烟（直连 8000，2026-11-14 15:00 复测）：账号太短/密码太短 → 422 中文；
+  注册 201 → /me 正确 → 登出 200 → me=null（浏览器语义，回写 Cookie jar）；
+  伪造 Cookie → me=null；空账号登录 → INVALID_CREDENTIALS 401。
 
 待办
-- 前端还没有登录页（App.tsx 目前直接用匿名流程）；需要"登录/注册 → 创建面试 → 我的面试"三段界面。
-- 登录失败次数限制（当前可无限试密码）；AUTH_SECRET 轮换会让所有登录态失效（预期行为）。
+- 缺"我的面试"列表页（后端也还没有 GET /api/interviews 列表接口）。
+- 登录失败次数限制（当前可无限试密码）；AUTH_SECRET 轮换会让所有登录态失效（预期行为）；
+  无状态令牌登出即清 Cookie，但已泄露的令牌在过期前仍有效（需要真正的踢下线就要会话表/黑名单）。
+- 匿名时期创建的会话在登录后不会自动"认领"到账号（有意为之：避免共享浏览器上的会话被
+  后来登录的人顺手接管）；要认领需要单独的产品口径与一次显式确认。
 - checkpoint 无 TTL：Redis 里测试残留 1000+ key，建议会话结束 delete_thread + 24h 兜底过期。
+
+阶段 7：可靠性（P0）+ 解析与出题体验（P1）+ 前端可靠性（P2）
+（2026-11-14 19:40-21:00，204 测试；对应《开发说明2》第一、二部分）
+
+【P0-1 幂等语义重排（问题 C）】
+- submit_answer 的顺序改成：归属 → 题目 → **幂等（回放/冲突）** → 终态检查。
+  以前终态检查排在前面，最后一题提交成功但响应丢失时，同 request_id 重试必得
+  SESSION_FINISHED，那份评分永远拿不回来。现在只有**新** request_id 才回 SESSION_FINISHED。
+
+【P0-2 图位置对账（问题 A，最重要）】
+- interview_answers 新增三列（迁移 8c1d4f0a7b52）：graph_stage、graph_wait_question_id、
+  last_error_code。每次提交都把"处理前图在哪"记下来。
+- graph_runtime 新增 GraphSnapshot + snapshot()：一次取齐 values/next/interrupt，并把位置
+  分类成 WAITING_INTERRUPT / NODE_INTERRUPTED / GRAPH_FINISHED / NO_CHECKPOINT。
+  不再用"有没有 checkpoint"当一个判据——有 checkpoint 也可能是"节点失败"或"已跑完"。
+- _run_and_persist 按真实位置分四种走法：
+  · 等的就是这一题 → resume；
+  · 等的是别的题且本次是重试 → 图已消费过 → **只补写**数据库与快照（_rebuild_from_state）；
+  · 节点失败 → continue_run（LangGraph 只重跑失败节点，评分不重算）；
+  · 图已跑完 → 补写最终响应；对不上账（图里找不到第 index 条评分）→ STATE_RECOVERY_REQUIRED。
+- 评分不再盲取 evaluations[-1]：按题序算出 index，取 evaluations[index]，越界即判"对不上账"。
+
+【P0-3 恢复补齐（问题 B）】
+- safe_wait_point 仍以 COMPLETED 为准，但恢复前先**补齐有评分的行**：_complete_evaluated
+  用规则链（纯函数）补裁决、用题序补下一题、写 response_snapshot，再置 COMPLETED。
+  以前这种行被当未作答：评分白丢，且 (session_id,question_id) 唯一约束把这题永久锁死。
+- 恢复后新增 _verify_rebuilt 四重核对：真的停在 wait_answer、中断坐标 == 数据库当前题、
+  评分条数 == 已完成条数、追问次数没被清零。任一条不符 → 删掉不可信 thread 并报
+  STATE_RECOVERY_REQUIRED（绝不"invoke 一次就宣布恢复成功"）。
+
+【P0-4 错误码分层】
+- 新增 MODEL_UNAVAILABLE / MATERIAL_INSUFFICIENT / UNREADABLE_MATERIAL，与 MODEL_TIMEOUT /
+  MODEL_OUTPUT_INVALID 分开；classify_model_exception 把供应商异常归类（超时 vs 不可用）。
+- UnreadableMaterialError 继承 MaterialInsufficientError，老的统一捕获仍然有效。
+
+【P0-5 显式恢复接口】
+- 新增 POST /api/interviews/{id}/recover：提交返回 STATE_RECOVERY_REQUIRED 时前端可以
+  主动重建（拿锁 + 对账 + 补写），不是只能刷新碰运气。
+
+【P1-1 DOCX 内嵌图片（问题 F）】
+- document._docx_image_blocks 从 word/media/ 取图，转 RenderBlock（EXIF 转正、≤2000 边长、
+  JPEG 重编码），标签「简历.docx 内嵌图片 N」；图片与文字一起送视觉模型。
+- ZIP 安全闸：条目数 ≤512、单条解压 ≤8MiB、总量 ≤40MiB、压缩比 ≤200、拒绝路径穿越；
+  单张损坏只 warning，不拖垮整份简历。
+- 整篇都是图片的 DOCX 不再判"无内容"，交给视觉模型。
+
+【P1-2 解析有限修复（问题 G）】
+- parse_agent 首次校验失败时最多修一次：修复调用**不带简历原文、不带图片**，只给
+  上一次输出 + 字段路径/错误类型/约束。修不好 → MODEL_OUTPUT_INVALID。
+- 日志只留字段路径与错误类型；不打印模型输出、材料原文、Base64。
+- 语义校验：resume 无教育/经历/项目 → MATERIAL_INSUFFICIENT；完全没内容 → UNREADABLE_MATERIAL。
+
+【P1-3 JD 提前校验（问题 H）】
+- 新增 pipeline.validate_jd_text，由 API 在**返回 202 之前**调用：非空但 <10 字 → 422
+  INVALID_JD_TEXT；只填空格按"未提供"处理。以前要等后台任务才炸，且整场面试失败。
+- 同时把"JD 文件 + JD 文字"互斥校验也前移（原有），Swagger 的 jd_text 描述写清约束。
+
+【P1-4 准备阶段细分进度（问题 I/J）】
+- _run_preparation 逐阶段写 progress：QUEUED → VALIDATING_UPLOAD → PARSING_MATERIAL
+  （带 text_blocks/render_blocks/char_count）→ VALIDATING_MATERIAL → GENERATING_QUESTIONS
+  → PERSISTING_QUESTIONS → WAITING_ANSWER；失败写 PREPARATION_FAILED + failed_stage + error_code。
+- 新增 POST /api/interviews/{id}/retry-preparation：只重跑出题，材料从 PG 读，不解析、
+  不要求重传；retry_count 上限 3；材料没存下（解析阶段失败）返回 MATERIAL_MISSING。
+- 文本总量上限 MAX_TEXT_CHARS=60000，超出按块截断并写 warning（不假装全读了）。
+
+【P2 前端可靠性】
+- 待重试提交落 sessionStorage（session_id/question_id/request_id/answer/skip）：刷新后先查
+  会话状态，题还是那道就用**同一 request_id** 续跑；题变了则清掉，绝不用新 id 重投。
+- 轮询改 setTimeout 单飞 + 分级：404/410/SESSION_NOT_FOUND/EXPIRED 立刻停止并清引用；
+  5xx/网络按 2s→4s→…→15s 退避，最多 6 次后转"准备失败"；PREPARATION_FAILED 停止并说明。
+- 记录加载失败显示原因 + "重新加载记录"按钮，不清空已加载成功的记录。
+- 准备页显示阶段中文名、已用秒数、已提取字数/图片数 + 阶段小标签；新增"准备失败"页，
+  提供「重试出题（不用重传简历）」与「重新上传简历」。
+- JD 文字前端即时校验（<10 字标黄并禁用提交），与后端同一口径。
+- STATE_RECOVERY_REQUIRED 时保留原文与 request_id，给「恢复并继续」按钮（先 recover 再重投）。
+
+验证
+- pytest tests：204 passed（177 → +27）。新增覆盖：终态后回放、图推进后不跳题、锁失效不写入、
+  Redis 不可用不绕过锁、恢复补齐已存评分、DOCX 内嵌图片、解压炸弹/路径穿越/图片数上限/
+  损坏图片、文字/扫描 PDF、EXIF 旋转、解析修复一次成功/仍失败/超时与不可用分类、
+  JD 太短 422 且不建会话、重试出题复用材料、无材料时要求重传、非失败态拒绝重试。
+- alembic：head = 8c1d4f0a7b52，alembic check 无漂移。
+- 前端：tsc --noEmit 通过、vite build 通过（252 kB / gzip 79 kB）。
+
+待办（本轮未做）
+- 前端行为项只做了代码层与构建验证，浏览器端到端点检需要在服务启动后手动过一遍
+  （尤其"刷新时待提交续跑"和"准备失败重试出题"两条）。
+- checkpoint 无 TTL 仍未处理；"我的面试"列表页仍缺；登录失败无次数限制。

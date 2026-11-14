@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any
 
@@ -26,6 +27,14 @@ from app.graph.builder import build_interview_graph
 from app.infrastructure.checkpoint import get_checkpointer
 
 log = get_logger(__name__)
+
+# 图侧状态分类。**不要**用"有没有 checkpoint"当唯一判断：
+# 一个 thread 有 checkpoint，也可能停在"节点抛错可继续"或"已跑完"的位置，
+# 这两种状态下把旧回答再喂进去，等于给下一题/已结束的会话乱塞输入。
+GRAPH_WAITING = "WAITING_INTERRUPT"     # 停在 interrupt，等某道题的回答
+GRAPH_NODE_FAILED = "NODE_INTERRUPTED"  # 节点抛错，next 非空但没有 interrupt
+GRAPH_FINISHED = "GRAPH_FINISHED"       # 图已跑完（无 next、无 interrupt）
+GRAPH_MISSING = "NO_CHECKPOINT"         # 没有任何执行状态
 
 
 @lru_cache(maxsize=4)
@@ -76,24 +85,91 @@ def interrupt_payload(result: Any) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
+@dataclass(frozen=True)
+class GraphSnapshot:
+    """图在**此刻**的执行位置（对账用）。
+
+    值必须一次性取齐：分两次 get_state 之间别的请求可能推进图，
+    拿到的"等待题"和"状态值"就会互相矛盾。
+    """
+
+    values: dict = field(default_factory=dict)
+    next_nodes: tuple[str, ...] = ()
+    waiting: bool = False
+    interrupt: dict | None = None
+
+    @property
+    def stage(self) -> str:
+        if self.waiting:
+            return GRAPH_WAITING
+        if self.next_nodes:
+            return GRAPH_NODE_FAILED
+        if self.values:
+            return GRAPH_FINISHED
+        return GRAPH_MISSING
+
+    @property
+    def wait_main_index(self) -> int | None:
+        if not self.interrupt:
+            return None
+        value = self.interrupt.get("main_index")
+        return value if isinstance(value, int) else None
+
+    @property
+    def wait_follow_up_index(self) -> int | None:
+        if not self.interrupt:
+            return None
+        value = self.interrupt.get("follow_up_index", 0)
+        return value if isinstance(value, int) else None
+
+    def waits_for(self, main_index: int, follow_up_index: int) -> bool | None:
+        """图等的是不是这道题。
+
+        None 表示**无法判断**（不在等待点 / payload 缺坐标）——
+        调用方必须把 None 与 False 区别对待，不能当成"不是它"。
+        """
+        if not self.waiting:
+            return None
+        m, f = self.wait_main_index, self.wait_follow_up_index
+        if m is None or f is None:
+            return None
+        return (m, f) == (main_index, follow_up_index)
+
+
+def snapshot(graph: CompiledStateGraph, session_id) -> GraphSnapshot:
+    """取一次完整快照（值 + 下一批节点 + 中断 payload）。"""
+    snap = graph.get_state(thread_config(session_id))
+    interrupts = tuple(getattr(snap, "interrupts", ()) or ())
+    payload = None
+    if interrupts:
+        value = getattr(interrupts[0], "value", None)
+        payload = value if isinstance(value, dict) else None
+    return GraphSnapshot(
+        values=dict(snap.values or {}),
+        next_nodes=tuple(snap.next or ()),
+        waiting=bool(interrupts),
+        interrupt=payload,
+    )
+
+
 def snapshot_state(graph: CompiledStateGraph, session_id) -> tuple[dict, tuple[str, ...], bool]:
     """返回 (状态值, 下一批节点, 是否在等待回答)。
 
     `是否在等待` 用 snapshot.interrupts 判断，比看 next 更准：
     节点抛错时 next 也有值，但没有 interrupt。
     """
-    snap = graph.get_state(thread_config(session_id))
-    waiting = bool(getattr(snap, "interrupts", ()))
-    return dict(snap.values or {}), tuple(snap.next or ()), waiting
+    snap = snapshot(graph, session_id)
+    return snap.values, snap.next_nodes, snap.waiting
 
 
 def has_checkpoint(graph: CompiledStateGraph, session_id) -> bool:
     """Redis 里是否还有这场会话的执行状态。
 
     空 values + 无 next + 无 interrupt = 没有检查点，必须走恢复入口（§9.4）。
+    注意：这只回答"有没有"，不回答"能不能继续"——后者用 snapshot().stage。
     """
-    values, next_nodes, waiting = snapshot_state(graph, session_id)
-    return bool(values) or bool(next_nodes) or waiting
+    snap = snapshot(graph, session_id)
+    return snap.stage != GRAPH_MISSING
 
 
 def resume_answer(graph: CompiledStateGraph, session_id, payload: dict) -> Any:

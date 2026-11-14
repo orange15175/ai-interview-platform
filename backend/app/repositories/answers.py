@@ -145,6 +145,7 @@ def complete(
     answer.processing_stage = "COMPLETED"
     answer.response_snapshot = response_snapshot
     answer.result_state_version = result_state_version
+    answer.last_error_code = None
     answer.completed_at = utcnow()
     db.flush()
     return answer
@@ -154,10 +155,31 @@ def fail(db: OrmSession, answer: InterviewAnswer, *, code: str, message: str) ->
     """处理失败：保留记录与阶段，供恢复入口对账（不删行）。"""
     answer.processing_status = "FAILED"
     answer.processing_stage = answer.processing_stage or "FAILED"
+    answer.last_error_code = code
     answer.response_snapshot = {
         "error": {"code": code, "message": message[:300]},
     }
     answer.completed_at = None
+    db.flush()
+    return answer
+
+
+def record_graph_position(
+    db: OrmSession,
+    answer: InterviewAnswer,
+    *,
+    stage: str,
+    wait_question_id: uuid.UUID | None,
+) -> InterviewAnswer:
+    """记录"这一段处理时图在哪"。
+
+    重试时它是唯一能把"图已推进"和"图还在等这一题"分开的证据：
+    两次记录的等待题不同 → 图消费过这次回答，只能补写数据库，不能重跑。
+    """
+    answer.graph_stage = stage
+    answer.graph_wait_question_id = (
+        _as_uuid(wait_question_id) if wait_question_id is not None else None
+    )
     db.flush()
     return answer
 

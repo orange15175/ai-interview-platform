@@ -28,6 +28,24 @@ def get(db: OrmSession, session_id: uuid.UUID | str) -> InterviewMaterial | None
     return db.scalars(stmt).one_or_none()
 
 
+def load_parsed(db: OrmSession, session_id: uuid.UUID | str) -> ParsedMaterials | None:
+    """把已落库的解析结果还原成 ParsedMaterials。
+
+    "重试出题"靠它：材料解析已经花过钱、也已经校验过，出题失败没有理由
+    让用户再传一次简历、再解析一遍（§十 第 4 条）。
+    """
+    row = get(db, session_id)
+    if row is None:
+        return None
+    return ParsedMaterials.model_validate({
+        "resume": row.resume_profile or {},
+        "jd": row.jd_profile,
+        "evidence": row.evidence or [],
+        "uncertain_fields": row.uncertain_fields or [],
+        "warnings": row.warnings or [],
+    })
+
+
 def save_parsed(
     db: OrmSession,
     *,

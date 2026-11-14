@@ -14,7 +14,7 @@ import json
 from pydantic import ValidationError
 
 from app.agents.adapters import get_text_adapter
-from app.core.errors import ModelCallError, ModelOutputInvalidError
+from app.core.errors import ModelCallError, ModelOutputInvalidError, classify_model_exception
 from app.core.logging import get_logger
 from app.llm_utils import ModelOutputError, parse_json_object
 from app.schemas.evaluation import Evaluation, FollowUpQuestion
@@ -94,7 +94,7 @@ def generate_followup(
                                    max_tokens=500, json_mode=True)
         except Exception as exc:  # noqa: BLE001
             log.warning("追问模型调用失败（第 %d 次）: %s", attempt + 1, type(exc).__name__)
-            raise ModelCallError("追问服务暂时不可用，请稍后重试") from exc
+            raise classify_model_exception(exc, message="追问服务暂时不可用，请稍后重试") from exc
 
         try:
             data = parse_json_object(raw)

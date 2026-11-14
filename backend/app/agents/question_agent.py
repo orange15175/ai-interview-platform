@@ -13,7 +13,7 @@ import json
 from pydantic import ValidationError
 
 from app.agents.adapters import get_text_adapter
-from app.core.errors import ModelCallError, ModelOutputInvalidError
+from app.core.errors import ModelCallError, ModelOutputInvalidError, classify_model_exception
 from app.core.logging import get_logger
 from app.llm_utils import ModelOutputError, parse_json_object
 from app.schemas.materials import ParsedMaterials
@@ -112,7 +112,7 @@ def generate_questions(
                                    max_tokens=8000, json_mode=True)
         except Exception as exc:  # noqa: BLE001
             log.warning("出题模型调用失败（第 %d 次）: %s", attempt + 1, type(exc).__name__)
-            raise ModelCallError("出题服务暂时不可用，请稍后重试") from exc
+            raise classify_model_exception(exc, message="出题服务暂时不可用，请稍后重试") from exc
 
         try:
             qs = _validate(raw, count, evidence_ids)

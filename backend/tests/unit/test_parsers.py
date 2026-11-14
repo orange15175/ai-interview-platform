@@ -1,13 +1,16 @@
 """解析层测试：真实生成 DOCX/PDF/图片后在内存里跑一遍（不落盘、不联网）。"""
 
 import io
+import zipfile
 
 import pytest
 from PIL import Image
 
 from app.core.config import BusinessDefaults
+from app.parsers import document, pipeline
 from app.parsers.document import extract_docx, extract_pdf, normalize_image
 from app.parsers.files import FileValidationError, validate_upload
+from app.parsers.types import ParsedInput, TextBlock
 
 LIMITS = BusinessDefaults()
 
@@ -137,3 +140,139 @@ def test_normalize_image_keeps_small_photo():
     with Image.open(io.BytesIO(renders[0].data)) as img:
         assert img.size == (800, 600)
     assert warnings == []
+
+
+# ---------------------------------------------------------------- DOCX 内嵌图片
+
+
+def _make_docx_with_image() -> bytes:
+    """文字 + 一张内嵌图片：设计稿式简历的典型形态。"""
+    import docx
+
+    png = io.BytesIO()
+    Image.new("RGB", (600, 400), "white").save(png, format="PNG")
+    png.seek(0)
+
+    d = docx.Document()
+    d.add_paragraph("个人信息：后端工程师")
+    d.add_picture(png, width=docx.shared.Inches(4))
+    buf = io.BytesIO()
+    d.save(buf)
+    return buf.getvalue()
+
+
+def test_docx_embedded_image_becomes_render_block():
+    texts, images, warnings = extract_docx(_make_docx_with_image(), "resume", "简历.docx")
+    assert len(texts) == 1
+    assert len(images) == 1
+    # 标签必须说明来源，模型才知道这张图属于同一份简历
+    assert "简历.docx" in images[0].label and "内嵌图片 1" in images[0].label
+    with Image.open(io.BytesIO(images[0].data)) as img:
+        assert img.size == (600, 400)
+    assert any("内嵌图片" in w for w in warnings)
+
+
+def _fake_docx_zip(entries: dict[str, bytes]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        # 必须有 document.xml，才像一个 docx
+        zf.writestr("word/document.xml", "<w:document/>")
+        for name, data in entries.items():
+            zf.writestr(name, data)
+    return buf.getvalue()
+
+
+def test_docx_image_zip_expansion_bomb_is_rejected():
+    """高压缩比条目（解压炸弹）不许被读进内存。"""
+    bomb = b"\x00" * (6 * 1024 * 1024)  # 解压 6 MiB，压缩后只有几 KB
+    data = _fake_docx_zip({"word/media/image1.png": bomb})
+
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        info = zf.getinfo("word/media/image1.png")
+    assert info.file_size / max(info.compress_size, 1) > 200
+
+    blocks, warnings = document._docx_image_blocks(
+        data, "resume", "简历.docx", LIMITS
+    )
+    assert blocks == []
+    assert any("压缩比异常" in w for w in warnings)
+
+
+def test_docx_image_path_traversal_entry_ignored():
+    png = _make_png((300, 300))
+    data = _fake_docx_zip({
+        "word/media/../../evil.png": png,
+        "word/media/image1.png": png,
+    })
+    blocks, warnings = document._docx_image_blocks(data, "resume", "简历.docx", LIMITS)
+    assert len(blocks) == 1  # 只认合法条目
+    assert any("可疑压缩包条目" in w for w in warnings)
+
+
+def test_docx_image_count_and_bytes_limits():
+    png = _make_png((300, 300))
+    many = {f"word/media/image{i}.png": png for i in range(1, 12)}
+    blocks, warnings = document._docx_image_blocks(
+        _fake_docx_zip(many), "resume", "简历.docx", LIMITS
+    )
+    assert len(blocks) == document.DOCX_MAX_IMAGES
+    assert any("仅解析前" in w for w in warnings)
+
+
+def test_corrupt_docx_image_warns_instead_of_crashing():
+    data = _fake_docx_zip({"word/media/image1.png": b"not an image at all"})
+    blocks, warnings = document._docx_image_blocks(data, "resume", "简历.docx", LIMITS)
+    assert blocks == []
+    assert any("已损坏" in w for w in warnings)
+
+
+# ---------------------------------------------------------------- PDF 逐页
+
+
+def test_text_pdf_extracts_text_only():
+    texts, renders, warnings = extract_pdf(_make_text_pdf(), "resume", "简历.pdf", LIMITS)
+    assert len(texts) == 1 and texts[0].page == 1
+    assert renders == []
+    assert warnings == []
+
+
+def test_scanned_pdf_becomes_image_page():
+    import pymupdf as fitz
+
+    png = io.BytesIO()
+    Image.new("RGB", (600, 400), "white").save(png, format="PNG")
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_image(fitz.Rect(40, 40, 560, 400), stream=png.getvalue())
+    data = doc.tobytes()
+    doc.close()
+
+    texts, renders, warnings = extract_pdf(data, "resume", "简历.pdf", LIMITS)
+    assert texts == []
+    assert len(renders) == 1 and renders[0].page == 1
+    assert any("转为图片" in w for w in warnings)
+
+
+def test_image_exif_orientation_is_applied():
+    """手机竖拍照片：EXIF orientation=6 必须转正，否则模型读到横图。"""
+    img = Image.new("RGB", (400, 200), "white")
+    exif = img.getexif()
+    exif[274] = 6  # 顺时针旋转 90°
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", exif=exif)
+
+    renders, _ = normalize_image(buf.getvalue(), "resume", "照片.jpg")
+    with Image.open(io.BytesIO(renders[0].data)) as out:
+        assert out.size == (200, 400)
+
+
+def test_text_input_is_capped_with_warning():
+    """超长文字不能整段送模型（超时与费用失控），截断必须留痕。"""
+    parsed = ParsedInput(
+        text_blocks=[TextBlock(source="resume", label="简历.txt", text="字" * 50_000)],
+        render_blocks=[],
+        warnings=[],
+    )
+    pipeline._cap_text(parsed, limit=1_000)
+    assert parsed.char_count() == 1_000
+    assert any("未送入模型" in w for w in parsed.warnings)

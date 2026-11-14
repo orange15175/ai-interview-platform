@@ -37,7 +37,7 @@ from app.repositories import questions as questions_repo
 from app.repositories import sessions as sessions_repo
 from app.repositories import visitors as visitors_repo
 from app.schemas.questions import GeneratedQuestion, RubricPoint
-from app.services import interview_workflow
+from app.services import graph_runtime, interview_workflow
 
 
 class FakeLock:
@@ -276,6 +276,141 @@ def test_followup_failure_then_retry_reuses_evaluation(env, monkeypatch):
 
 
 # ---------------------------------------------------------------- 全流程收尾
+
+
+def _answer_all(env):
+    """答完所有题，返回 [(question, response, request_id)]。"""
+    current = env.started["question"]
+    seen = []
+    for i in range(12):
+        req = f"req-all-{i}"
+        res = _submit(env, question_id=current["question_id"], request_id=req)
+        seen.append((current, res, req))
+        if res["finished"]:
+            return seen
+        current = res["next_question"]
+    raise AssertionError("提交次数超过上限，疑似死循环")
+
+
+def test_replay_after_finished_still_returns_original_response(env):
+    """最后一题提交成功、响应丢了：重试必须回放，不能回 SESSION_FINISHED。
+
+    这是"终态检查排在幂等检查之前"会造成的真实故障：会话已经 FINISHED，
+    用户手里那条评分就永远拿不回来了。
+    """
+    seen = _answer_all(env)
+    last_question, last_res, last_req = seen[-1]
+    assert last_res["finished"] is True
+
+    env.db.refresh(env.session)
+    assert env.session.status == "FINISHED"
+
+    again = interview_workflow.submit_answer(
+        db=env.db,
+        graph=env.graph,
+        session_id=env.session.id,
+        owner_id=env.visitor.id,
+        question_id=last_question["question_id"],
+        request_id=last_req,
+        answer="我做了取舍并给出量化结果。",
+        redis_client=None,
+    )
+    assert again["replayed"] is True
+    assert again["answer_id"] == last_res["answer_id"]
+    assert again["evaluation"]["score"] == last_res["evaluation"]["score"]
+    assert again["state_version"] == last_res["state_version"]
+
+    # 只有**新的** request_id 才允许拿到 SESSION_FINISHED
+    from app.core.errors import SessionFinishedError
+
+    with pytest.raises(SessionFinishedError):
+        _submit(env, question_id=last_question["question_id"])
+
+
+def test_graph_advanced_but_db_write_lost_does_not_skip_question(env):
+    """图已推进、数据库没写上：同一 request_id 重试只能补写，不能跳题。
+
+    以前这里会把旧回答当成下一位等待点的输入喂进去，结果一题被"吃"掉：
+    候选人看到的是第 3 题，实际已经答到第 4 题。
+    """
+    res = _submit(env, request_id="req-lost")
+    q1 = env.started["question"]
+    assert res["next_question"]["question_id"] != q1["question_id"]
+
+    # 还原成"完成写入整段丢了"：行还是 PENDING、无评分、无快照，会话没推进
+    row = answers_repo.get_by_request(env.db, env.session.id, "req-lost")
+    row.processing_status = "PENDING"
+    row.processing_stage = "GRAPH_RUNNING"
+    row.evaluation = None
+    row.rule_decision = None
+    row.score = None
+    row.response_snapshot = None
+    row.completed_at = None
+    env.session.state_version = 1
+    env.session.current_question_id = uuid.UUID(q1["question_id"])
+    env.session.status = "IN_PROGRESS"
+    env.db.commit()
+
+    retry = _submit(env, question_id=q1["question_id"], request_id="req-lost")
+
+    assert retry["replayed"] is False
+    assert retry.get("rebuilt") is True
+    assert retry["evaluation"]["score"] == res["evaluation"]["score"]
+    # 关键：下一题还是原来那道，没有被"吃掉"一题
+    assert retry["next_question"]["question_id"] == res["next_question"]["question_id"]
+
+    row = answers_repo.get_by_request(env.db, env.session.id, "req-lost")
+    assert row.processing_status == "COMPLETED"
+    assert row.response_snapshot["next_question"]["question_id"] == retry["next_question"]["question_id"]
+
+    # 图没有被再喂一遍：评分只追加过一次
+    values, _, waiting = graph_runtime.snapshot_state(env.graph, env.session.id)
+    assert waiting is True
+    assert len(values["evaluations"]) == 1
+
+
+def test_lock_lost_before_write_does_not_persist(env, monkeypatch):
+    """锁租约失效：结果不许写入，且必须能用同一个 request_id 重试回来。"""
+    lock = FakeLock()
+
+    def acquire(*args, **kwargs):
+        lock.lost = True  # 模型跑完时租约已经丢了
+        return lock
+
+    monkeypatch.setattr(interview_workflow.locks, "acquire", acquire)
+
+    with pytest.raises(VersionConflictError):
+        _submit(env, request_id="req-lock")
+
+    row = answers_repo.get_by_request(env.db, env.session.id, "req-lock")
+    assert row is not None and row.processing_status != "COMPLETED"
+    assert row.response_snapshot is None
+    env.db.refresh(env.session)
+    assert env.session.state_version == 1  # 版本没被推进
+
+    # 恢复真正的锁后重试：图已推进，只能补写（不跳题）
+    monkeypatch.setattr(interview_workflow.locks, "acquire", lambda *a, **k: FakeLock())
+    retry = _submit(env, request_id="req-lock")
+    assert retry["replayed"] is False
+    assert retry.get("rebuilt") is True
+    assert answers_repo.get(env.db, retry["answer_id"]).processing_status == "COMPLETED"
+
+
+def test_lock_unavailable_writes_nothing(env, monkeypatch):
+    """Redis 不可用：宁可 503，也绝不无锁写入。"""
+    from app.core.errors import LockUnavailableError
+
+    def boom(*args, **kwargs):
+        raise LockUnavailableError()
+
+    monkeypatch.setattr(interview_workflow.locks, "acquire", boom)
+
+    with pytest.raises(LockUnavailableError):
+        _submit(env, request_id="req-nolock")
+
+    assert answers_repo.get_by_request(env.db, env.session.id, "req-nolock") is None
+    env.db.refresh(env.session)
+    assert env.session.state_version == 1
 
 
 def test_answers_until_finished(env):

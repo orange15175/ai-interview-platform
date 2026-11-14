@@ -23,6 +23,7 @@ from typing import Any
 from langgraph.graph.state import CompiledStateGraph
 from sqlalchemy.orm import Session as OrmSession
 
+from app.core.config import get_settings
 from app.core.errors import (
     SessionFinishedError,
     StateRecoveryRequiredError,
@@ -112,7 +113,11 @@ def _seed_state(
 def _reconcile_unfinished(
     db: OrmSession, answers: list[InterviewAnswer]
 ) -> list[dict]:
-    """对账：把卡在 PENDING/PROCESSING 的提交标成 FAILED（留痕，不删除）。"""
+    """对账：把卡在 PENDING/PROCESSING 的提交标成 FAILED（留痕，不删除）。
+
+    只处理"确实没有可复用结果"的行。带评分的行走 _complete_evaluated，
+    否则会把已经花过钱、也已经算出来的评分当成未作答重来一遍。
+    """
     reconciled: list[dict] = []
     for row in answers:
         if row.processing_status in ("PENDING", "PROCESSING"):
@@ -122,6 +127,84 @@ def _reconcile_unfinished(
             )
             reconciled.append({"answer_id": str(row.id), "stage": row.processing_stage})
     return reconciled
+
+
+def _decision_record(question: InterviewQuestion, evaluation: dict | None,
+                     skipped: bool, asked_targets: list[str]) -> dict:
+    """用规则链重算裁决。纯函数、无模型调用，所以恢复时可以安全地补。"""
+    from app.schemas.evaluation import Evaluation
+    from app.rules.followup_rules import decide_followup
+
+    parsed = Evaluation.model_validate(evaluation) if evaluation else None
+    decision = decide_followup(
+        evaluation=parsed,
+        skipped=skipped,
+        followup_count=question.follow_up_index,
+        asked_targets=asked_targets,
+        max_followups=get_settings().business.max_followups,
+    )
+    return {
+        "main_index": question.main_index,
+        "decision": decision.decision,
+        "reason_code": decision.reason_code,
+        "rule_version": decision.rule_version,
+        "detail": decision.detail,
+        "target": (parsed.follow_up_target if parsed else "") or "",
+    }
+
+
+def _complete_evaluated(
+    db: OrmSession,
+    session: InterviewSession,
+    ordered: list[InterviewQuestion],
+    answers: dict[uuid.UUID, InterviewAnswer],
+    row: InterviewAnswer,
+    next_view: dict | None,
+) -> bool:
+    """评分已落库但回答没走完：补齐裁决与响应快照，**不重新评分**。
+
+    这正是"checkpoint 丢失 + 已有评分"的收口：把它当成未作答题会导致
+    1) 该题被唯一约束永久锁死（评分行删不掉）；2) 已经算出的分数被丢弃。
+    """
+    from app.services.interview_workflow import public_decision, public_evaluation
+
+    question = next((q for q in ordered if q.id == row.question_id), None)
+    if question is None:
+        return False
+
+    evaluation = row.evaluation if isinstance(row.evaluation, dict) else None
+    skipped = row.submission_kind == "skip"
+
+    if row.rule_decision is None:
+        asked = [
+            a.rule_decision.get("target", "")
+            for a in answers.values()
+            if a.rule_decision
+            and a.question_id != row.question_id
+            and a.rule_decision.get("main_index") == question.main_index
+            and a.rule_decision.get("decision") == "ask"
+        ]
+        asked = [t for t in asked if t]
+        answers_repo.save_decision(
+            db, row,
+            decision=_decision_record(question, evaluation, skipped, asked),
+        )
+
+    snapshot = {
+        "answer_id": str(row.id),
+        "question_id": str(row.question_id),
+        "evaluation": public_evaluation(evaluation),
+        "followup_decision": public_decision(row.rule_decision),
+        "next_question": next_view,
+        "finished": next_view is None,
+        "state_version": session.state_version,
+        "replayed": False,
+        "rebuilt": True,
+    }
+    answers_repo.complete(
+        db, row, response_snapshot=snapshot, result_state_version=session.state_version
+    )
+    return True
 
 
 def _drop_empty_attempt(db: OrmSession, row: InterviewAnswer | None) -> bool:
@@ -159,15 +242,33 @@ def recover_session(
             }
 
         questions = questions_repo.list_for_session(db, session.id)
-        mains = [q for q in questions if q.follow_up_index == 0]
+        ordered = sorted(questions, key=lambda q: (q.main_index, q.follow_up_index))
+        mains = [q for q in ordered if q.follow_up_index == 0]
         if not mains:
             raise StateRecoveryRequiredError("会话没有题目记录，无法恢复，请重新创建面试")
 
         all_answers = answers_repo.list_for_session(db, session.id)
         by_question = {a.question_id: a for a in all_answers}
+
+        # 1) 有评分但没走完的回答：补齐裁决与快照，**绝不能**当成未作答重来
+        backfilled = 0
+        for i, q in enumerate(ordered):
+            row = by_question.get(q.id)
+            if row is None or row.processing_status == "COMPLETED":
+                continue
+            if row.evaluation is None:
+                continue
+            next_q = ordered[i + 1] if i + 1 < len(ordered) else None
+            next_view = questions_repo.public_dict(next_q) if next_q is not None else None
+            if next_view is not None:
+                next_view["total_questions"] = len(mains)
+            if _complete_evaluated(db, session, ordered, by_question, row, next_view):
+                backfilled += 1
+
+        # 2) 其余卡在半途的提交：留痕关闭（不删除）
         reconciled = _reconcile_unfinished(db, all_answers)
 
-        pending = safe_wait_point(questions, by_question)
+        pending = safe_wait_point(ordered, by_question)
         if pending is None:
             sessions_repo.touch(
                 db, session, status="FINISHED", current_question_id=None,
@@ -184,6 +285,7 @@ def recover_session(
                 "finished": True,
                 "recovered": False,
                 "reconciled": reconciled,
+                "backfilled_evaluated": backfilled,
             }
 
         dropped = _drop_empty_attempt(db, by_question.get(pending.id))
@@ -196,15 +298,20 @@ def recover_session(
         if saver is not None:
             graph_runtime.delete_thread(saver, session.id)
 
-        seed = _seed_state(session, mains, questions, by_question, pending)
+        seed = _seed_state(session, mains, ordered, by_question, pending)
         result = restore_graph.invoke(seed, graph_runtime.thread_config(session.id))
         payload = graph_runtime.interrupt_payload(result)
         if payload is None:
             raise StateRecoveryRequiredError("恢复未停在等待点，请稍后重试")
 
+        _verify_rebuilt(restore_graph, session, pending, by_question, saver)
+
         if lock.lost:
             raise VersionConflictError("恢复过程中锁已失效，请重试")
 
+        completed_count = sum(
+            1 for a in by_question.values() if a.processing_status == "COMPLETED"
+        )
         new_version = sessions_repo.bump_state_version(db, session)
         sessions_repo.touch(
             db, session, status="IN_PROGRESS",
@@ -213,10 +320,7 @@ def recover_session(
                 "stage": "WAITING_ANSWER",
                 "current_main_index": pending.main_index,
                 "current_followup_index": pending.follow_up_index,
-                "answered_count": sum(
-                    1 for a in by_question.values()
-                    if a.processing_status == "COMPLETED" and a.evaluation is not None
-                ),
+                "answered_count": completed_count,
                 "recovered_at": True,
             },
             started=True,
@@ -224,8 +328,9 @@ def recover_session(
         db.commit()
 
         log.info(
-            "会话 %s 已从记录恢复：停在 main=%s follow=%s，对账 %d 条，清理空壳 %s",
-            session.id, pending.main_index, pending.follow_up_index, len(reconciled), dropped,
+            "会话 %s 已从记录恢复：停在 main=%s follow=%s，对账 %d 条，补写评分 %d 条，清理空壳 %s",
+            session.id, pending.main_index, pending.follow_up_index,
+            len(reconciled), backfilled, dropped,
         )
         view = questions_repo.public_dict(pending)
         view["total_questions"] = len(mains)
@@ -237,7 +342,49 @@ def recover_session(
             "finished": False,
             "recovered": True,
             "reconciled": reconciled,
+            "backfilled_evaluated": backfilled,
             "dropped_empty_attempts": 1 if dropped else 0,
         }
     finally:
         lock.release()
+
+
+def _verify_rebuilt(
+    graph: CompiledStateGraph,
+    session: InterviewSession,
+    pending: InterviewQuestion,
+    by_question: dict[uuid.UUID, InterviewAnswer],
+    saver,
+) -> None:
+    """重建后必须核对"图真的停在数据库认为的那一题"。
+
+    只 invoke 一次就宣布恢复成功是不够的：种子状态写错一个下标，图会安静地
+    停到别的题上，用户随后答的每一道题都会被记到错误的题号下。所以这里逐条验：
+    - 停在 wait_answer（不是节点失败、不是跑完）；
+    - 中断坐标 == 数据库当前题；
+    - 图里的评分条数 == 数据库已完成条数（少了说明历史没重建，多了说明重算了）；
+    - follow-up 次数没有被清零（清零会让追问次数超上限）。
+    任何一条不满足 → 删掉这个不可信的 thread，要求重试恢复。
+    """
+    snap = graph_runtime.snapshot(graph, session.id)
+    expected_completed = sum(
+        1 for a in by_question.values() if a.processing_status == "COMPLETED"
+    )
+    evaluations = snap.values.get("evaluations") or []
+    followups = snap.values.get("current_followup_index")
+
+    problem = None
+    if snap.stage != graph_runtime.GRAPH_WAITING:
+        problem = f"未停在等待点（{snap.stage}）"
+    elif snap.waits_for(pending.main_index, pending.follow_up_index) is not True:
+        problem = (f"中断坐标 ({snap.wait_main_index},{snap.wait_follow_up_index}) "
+                   f"与数据库当前题 ({pending.main_index},{pending.follow_up_index}) 不一致")
+    elif len(evaluations) != expected_completed:
+        problem = f"评分条数 {len(evaluations)} != 数据库已完成 {expected_completed}"
+    elif followups != pending.follow_up_index:
+        problem = f"追问次数 {followups} != 当前题追问序号 {pending.follow_up_index}"
+
+    if problem:
+        if saver is not None:
+            graph_runtime.delete_thread(saver, session.id)
+        raise StateRecoveryRequiredError(f"恢复结果与记录不一致：{problem}")

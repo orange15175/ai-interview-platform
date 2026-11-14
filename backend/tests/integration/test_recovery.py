@@ -192,6 +192,64 @@ def test_recover_all_answered_marks_finished(env):
     assert env.db.get(type(env.session), env.session.id).status == "FINISHED"
 
 
+def test_recover_keeps_saved_evaluation_instead_of_treating_as_unanswered(env, monkeypatch):
+    """评分已存、回答没走完 + checkpoint 丢失：补齐，不重评、不锁死该题。
+
+    老实现把"没有 COMPLETED"一律当未作答：这条已经花过钱、也已经算出分数的
+    记录会被空壳清理逻辑当成垃圾，而 (session_id, question_id) 唯一约束又把
+    这道题永久锁死——用户既答不了，也拿不回分数。
+    """
+    import app.graph.nodes as nodes
+    from app.core.errors import ModelCallError
+
+    calls = {"n": 0}
+    original_eval = nodes.evaluate_answer
+
+    def counting_eval(*args, **kwargs):
+        calls["n"] += 1
+        return original_eval(*args, **kwargs)
+
+    monkeypatch.setattr(nodes, "evaluate_answer", counting_eval)
+
+    with monkeypatch.context() as m:
+        def boom(*args, **kwargs):
+            raise ModelCallError()
+
+        m.setattr(nodes, "generate_followup", boom)
+        with pytest.raises(ModelCallError):
+            _submit(env, env.graph, env.started["question"]["question_id"], request_id="req-b")
+
+    row = answers_repo.get_by_request(env.db, env.session.id, "req-b")
+    assert row.processing_status == "FAILED"
+    assert row.evaluation is not None
+    saved_score = row.evaluation["score"]
+
+    graph2, restore_graph, _ = _lost_checkpoint_graphs()
+    result = recovery.recover_session(db=env.db, restore_graph=restore_graph, session=env.session)
+
+    assert result["recovered"] is True
+    assert result["backfilled_evaluated"] == 1
+    # 追问没生成成功 → 等待点直接落到第 2 题（宁可少问一次，也不重复计分）
+    assert result["question"]["main_index"] == 2
+
+    env.db.refresh(row)
+    assert row.processing_status == "COMPLETED"
+    assert row.evaluation["score"] == saved_score  # 分数复用，不重算
+    assert row.rule_decision is not None
+    assert row.response_snapshot["next_question"]["main_index"] == 2
+
+    # 重建后的图里带着这份历史评分，且没有把评分重跑一遍
+    values, _, waiting = graph_runtime.snapshot_state(graph2, env.session.id)
+    assert waiting is True
+    assert len(values["evaluations"]) == 1
+    assert calls["n"] == 1
+
+    # 还能继续答下一题
+    res = _submit(env, graph2, result["question"]["question_id"])
+    assert res["evaluation"] is not None
+    assert calls["n"] == 2
+
+
 def test_recover_without_questions_fails_loudly(env):
     empty = sessions_repo.create(env.db, owner_id=env.visitor.id)
     env.db.commit()

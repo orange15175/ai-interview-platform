@@ -38,7 +38,7 @@ from app.core.errors import AppError
 from app.core.logging import get_logger
 from app.models import AnonymousVisitor, User
 from app.parsers.files import validate_upload
-from app.parsers.pipeline import build_parsed_input
+from app.parsers.pipeline import build_parsed_input, validate_jd_text
 from app.repositories import answers as answers_repo
 from app.repositories import questions as questions_repo
 from app.repositories import sessions as sessions_repo
@@ -62,6 +62,21 @@ _PROCESS_STARTED_AT = datetime.now(timezone.utc)
 _PREPARATION_TIMEOUT_SECONDS = 180
 
 MAX_QUESTION_COUNT = 30  # 出题数上限（防费用失控，§11）
+# "重试出题"的次数上限：材料已存，出题失败最多再试 3 次，之后要求重新上传
+MAX_PREPARATION_RETRIES = 3
+
+# 准备阶段的稳定标识（前后端共用）：前端按它显示中文名与耗时
+PREPARATION_STAGES = (
+    "QUEUED",              # 已受理，等待后台任务开始
+    "VALIDATING_UPLOAD",   # 二次校验文件（真正能否打开）
+    "PARSING_MATERIAL",    # 解析简历/JD（视觉模型）
+    "VALIDATING_MATERIAL", # 解析结果的语义底线检查
+    "GENERATING_QUESTIONS",# 出题（文字模型）
+    "VALIDATING_QUESTIONS",# 题数/编号/rubric 校验
+    "PERSISTING_QUESTIONS",# 题目落库 + 启动图
+    "WAITING_ANSWER",      # 停在第一题，等作答
+    "PREPARATION_FAILED",  # 失败终态
+)
 
 
 def _as_aware_utc(value: datetime | None) -> datetime | None:
@@ -188,6 +203,92 @@ def _quick_validate(filename: str | None, data: bytes | None, label: str) -> Non
 # ---------------------------------------------------------------- 准备任务
 
 
+def _set_stage(db: OrmSession, session, stage: str, **extra) -> None:
+    """写准备阶段进度（每次都带 stage_started_at，前端才能算耗时）。"""
+    now = datetime.now(timezone.utc).isoformat()
+    previous = session.progress or {}
+    carried = {
+        k: previous[k]
+        for k in ("retry_count", "text_blocks", "render_blocks", "char_count", "warnings")
+        if previous.get(k) is not None
+    }
+    progress = {
+        **carried,
+        **{k: v for k, v in extra.items() if v is not None},
+        "stage": stage,
+        "stage_started_at": now,
+        "updated_at": now,
+        "question_count": extra.get("question_count") or session.question_count,
+    }
+    sessions_repo.touch(db, session, progress=progress)
+    db.commit()
+
+
+def _fail_preparation(db: OrmSession, session_id: str, exc: AppError | None,
+                      stage: str) -> None:
+    """失败收口：记录失败阶段 + 稳定错误码，绝不留下永远 PREPARING 的僵尸。"""
+    db.rollback()
+    session = sessions_repo.get(db, session_id)
+    if session is None:
+        return
+    sessions_repo.mark_preparation_failed(
+        db, session,
+        exc.message if exc is not None else "准备过程发生未预期的错误，请重试或重新上传",
+        stage=stage,
+        error_code=exc.code if exc is not None else "INTERNAL_ERROR",
+    )
+    db.commit()
+
+
+def _run_questions_only(*, session_id: str) -> None:
+    """只重跑出题：材料从 PostgreSQL 读，**不重新解析、不要求重传简历**。
+
+    出题失败时材料（往往已经花过视觉模型的钱）已经落库，重传一份简历等于
+    让用户为同一个错误付第二次钱（§十）。
+    """
+    from app.infrastructure.db import get_session_factory
+    from app.repositories import materials as materials_repo
+
+    db = get_session_factory()()
+    stage = "GENERATING_QUESTIONS"
+    try:
+        session = sessions_repo.get(db, session_id)
+        if session is None or session.status != "PREPARING":
+            return
+
+        parsed = materials_repo.load_parsed(db, session.id)
+        if parsed is None:
+            _fail_preparation(
+                db, session_id,
+                AppError("材料没有保存成功，请重新上传简历", code="MATERIAL_MISSING",
+                         http_status=409),
+                "PARSING_MATERIAL",
+            )
+            return
+
+        _set_stage(db, session, "GENERATING_QUESTIONS")
+        from app.agents.question_agent import generate_questions
+
+        questions = generate_questions(parsed, session.question_count)
+
+        stage = "PERSISTING_QUESTIONS"
+        _set_stage(db, session, stage, question_count=len(questions.questions))
+        interview_workflow.start_interview(
+            db=db, graph=graph_runtime.get_compiled_graph(),
+            session=session, questions=questions,
+        )
+        log.info("会话 %s 重试出题成功（复用已存材料）", session_id)
+    except AppError as exc:
+        _fail_preparation(db, session_id, exc, stage)
+        log.warning("会话 %s 重试出题失败 code=%s: %s", session_id, exc.code, exc.message)
+    except Exception as exc:  # noqa: BLE001
+        _fail_preparation(db, session_id, None, stage)
+        log.exception("会话 %s 重试出题异常: %s", session_id, type(exc).__name__)
+    finally:
+        _preparing.discard(session_id)
+        db.close()
+
+
 def _run_preparation(
     *,
     session_id: str,
@@ -200,12 +301,14 @@ def _run_preparation(
     """后台准备：解析 → 出题 → 启动图，停在第一题的等待点。
 
     全程自开数据库会话（后台任务拿不到请求级会话）。
-    任何失败都收口成 PREPARATION_FAILED（终态 + 脱敏错误），绝不留一个
-    "永远 PREPARING"的僵尸会话。
+    每个阶段都写进 session.progress（stage + stage_started_at），前端能显示
+    "解析中/出题中/保存题目"，而不是一句含糊的"准备中"。
+    任何失败都收口成 PREPARATION_FAILED（终态 + 脱敏错误 + 失败阶段）。
     """
     from app.infrastructure.db import get_session_factory
 
     db = get_session_factory()()
+    stage = "VALIDATING_UPLOAD"
     try:
         session = sessions_repo.get(db, session_id)
         if session is None or session.status != "PREPARING":
@@ -213,6 +316,7 @@ def _run_preparation(
                         session.status if session else "missing")
             return
 
+        _set_stage(db, session, "VALIDATING_UPLOAD")
         parsed_input = build_parsed_input(
             resume_filename=resume_filename,
             resume_bytes=resume_bytes,
@@ -220,9 +324,18 @@ def _run_preparation(
             jd_bytes=jd_bytes,
             jd_text=jd_text,
         )
+
+        stage = "PARSING_MATERIAL"
+        from app.parsers.pipeline import describe_input
+
+        _set_stage(db, session, stage, **describe_input(parsed_input))
+
         from app.agents.parse_agent import parse_materials
 
         parsed = parse_materials(parsed_input)
+
+        stage = "VALIDATING_MATERIAL"
+        _set_stage(db, session, stage, warnings=len(parsed.warnings))
 
         from app.repositories import materials as materials_repo
 
@@ -232,29 +345,26 @@ def _run_preparation(
         )
         db.commit()
 
+        stage = "GENERATING_QUESTIONS"
+        _set_stage(db, session, stage)
+
         from app.agents.question_agent import generate_questions
 
         questions = generate_questions(parsed, session.question_count)
+
+        stage = "PERSISTING_QUESTIONS"
+        _set_stage(db, session, stage, question_count=len(questions.questions))
         interview_workflow.start_interview(
             db=db, graph=graph_runtime.get_compiled_graph(),
             session=session, questions=questions,
         )
         log.info("会话 %s 准备完成，进入答题", session_id)
     except AppError as exc:
-        db.rollback()
-        session = sessions_repo.get(db, session_id)
-        if session is not None:
-            sessions_repo.mark_preparation_failed(db, session, exc.message)
-            db.commit()
-        log.warning("会话 %s 准备失败 code=%s: %s", session_id, exc.code, exc.message)
+        _fail_preparation(db, session_id, exc, stage)
+        log.warning("会话 %s 准备失败 stage=%s code=%s: %s",
+                    session_id, stage, exc.code, exc.message)
     except Exception as exc:  # noqa: BLE001 —— 后台任务没有调用方接异常，必须自己收口
-        db.rollback()
-        session = sessions_repo.get(db, session_id)
-        if session is not None:
-            sessions_repo.mark_preparation_failed(
-                db, session, "准备过程发生未预期的错误，请重试或重新上传"
-            )
-            db.commit()
+        _fail_preparation(db, session_id, None, stage)
         log.exception("会话 %s 准备异常: %s", session_id, type(exc).__name__)
     finally:
         _preparing.discard(session_id)
@@ -272,9 +382,16 @@ def _run_preparation(
 )
 async def create_interview(
     background_tasks: BackgroundTasks,
-    resume: UploadFile = File(..., description="简历（docx/pdf/图片）"),
-    jd: UploadFile | None = File(None, description="岗位描述文件（可选）"),
-    jd_text: str | None = Form(None, description="岗位描述文字（可选，与 jd 文件互斥）"),
+    resume: UploadFile = File(..., description="简历（docx/pdf/图片，≤10MiB）"),
+    jd: UploadFile | None = File(None, description="岗位描述文件（可选，与 jd_text 互斥）"),
+    jd_text: str | None = Form(
+        None,
+        description=(
+            "岗位描述文字（可选，与 jd 文件互斥）。"
+            "留空或只填空格视为未提供；填写则至少 10 个字，"
+            "不足会在返回 202 之前直接 422（不会先受理再后台失败）。"
+        ),
+    ),
     question_count: int | None = Form(None, description="题目数量（默认 15）"),
     visitor: AnonymousVisitor = Depends(get_visitor),
     user: User | None = Depends(get_current_user),
@@ -292,15 +409,17 @@ async def create_interview(
         resume, limit_mb=limits.max_file_mb, label="简历"
     )
     jd_name, jd_data = await _read_upload(jd, limit_mb=limits.max_file_mb, label="岗位描述")
-    jd_text = jd_text.strip() if jd_text and jd_text.strip() else None
 
     if resume_name is None:
         raise AppError("请上传简历文件", code="INVALID_FILE", http_status=422)
-    if jd_data is not None and jd_text:
+    if jd_data is not None and jd_text and jd_text.strip():
         raise AppError(
             "JD 请只提供一种形式：文件或文字，不要同时上传",
             code="INVALID_FILE", http_status=422,
         )
+
+    # JD 文字长度在 202 之前校验：放到后台做，用户要等半分钟才知道填短了（§八）
+    jd_text = validate_jd_text(jd_text)
 
     # 快速校验放在 202 之前：用户立刻知道文件合不合规，不用轮询才知道
     _quick_validate(resume_name, resume_data, "简历")
@@ -312,7 +431,13 @@ async def create_interview(
         question_count=question_count,
         user_id=user.id if user else None,
     )
-    db.commit()
+    _set_stage(
+        db, session, "QUEUED",
+        retry_count=0,
+        resume_size=len(resume_data or b""),
+        jd_size=len(jd_data or b""),
+        jd_text_chars=len(jd_text or ""),
+    )
 
     sid = str(session.id)
     _preparing.add(sid)
@@ -333,8 +458,72 @@ async def create_interview(
     }
 
 
-# ---------------------------------------------------------------- 查询类
+# ---------------------------------------------------------------- 重试准备
 
+
+@router.post(
+    "/{session_id}/retry-preparation",
+    status_code=202,
+    summary="解析成功但出题失败：复用已存材料只重跑出题",
+    dependencies=[Depends(require_same_origin)],
+)
+def retry_preparation(
+    session_id: str,
+    background_tasks: BackgroundTasks,
+    visitor: AnonymousVisitor = Depends(get_visitor),
+    user: User | None = Depends(get_current_user),
+    db: OrmSession = Depends(get_db),
+) -> dict:
+    """重新出题（不需要重传简历、不重新调用解析模型）。
+
+    前提是解析结果已经落库；没落库说明失败发生在解析阶段，只能重新上传。
+    重试次数有限（每次失败都会记录阶段），避免无限重试把费用打上去。
+    """
+    from app.repositories import materials as materials_repo
+
+    session = _owned_session(db, session_id, visitor, user)
+    if session.status != "PREPARATION_FAILED":
+        raise AppError(
+            "只有准备失败的面试可以重试出题",
+            code="INVALID_STATE", http_status=409,
+        )
+
+    materials = materials_repo.get(db, session.id)
+    if materials is None:
+        raise AppError(
+            "材料没有保存成功（失败发生在解析阶段），请重新上传简历",
+            code="MATERIAL_MISSING", http_status=409,
+        )
+
+    retries = int((session.progress or {}).get("retry_count") or 0)
+    if retries >= MAX_PREPARATION_RETRIES:
+        raise AppError(
+            f"已重试 {retries} 次仍未成功，请重新上传简历",
+            code="RETRY_LIMIT_REACHED", http_status=409,
+        )
+
+    _set_stage(db, session, "QUEUED", retry_count=retries + 1, attempt=retries + 1)
+    sessions_repo.touch(
+        db, session,
+        status="PREPARING",
+        completion_reason=None,
+        sanitized_error=None,
+        finished=False,
+    )
+    db.commit()
+
+    _preparing.add(session_id)
+    background_tasks.add_task(_run_questions_only, session_id=session_id)
+    log.info("会话 %s 触发重试出题（第 %d 次）", session_id, retries + 1)
+    return {
+        "session_id": session_id,
+        "status": "PREPARING",
+        "retry_count": retries + 1,
+        "state_version": session.state_version,
+    }
+
+
+# ---------------------------------------------------------------- 查询类
 
 @router.get("/{session_id}", summary="查询进度与可恢复性（只读）")
 def get_interview(
@@ -349,7 +538,11 @@ def get_interview(
     if session.status == "PREPARING" and _is_orphan_preparing(session, session_id):
         # 进程重启/任务丢失导致准备任务孤儿化：如实标记失败，让用户重新上传（§10）
         sessions_repo.mark_preparation_failed(
-            db, session, "准备过程被服务重启或中断，请重新上传材料"
+            db, session,
+            "准备过程被服务重启或中断，请重新上传材料；"
+            "若简历已经解析成功，也可直接点「重试出题」继续",
+            stage=(session.progress or {}).get("stage"),
+            error_code="PREPARATION_INTERRUPTED",
         )
         db.commit()
         db.refresh(session)
@@ -369,6 +562,32 @@ def get_interview(
     if session.sanitized_error:
         view["sanitized_error"] = session.sanitized_error
     return view
+
+
+@router.post(
+    "/{session_id}/recover",
+    summary="显式从记录恢复（状态不一致时用）",
+    dependencies=[Depends(require_same_origin)],
+)
+def recover_interview(
+    session_id: str,
+    visitor: AnonymousVisitor = Depends(get_visitor),
+    user: User | None = Depends(get_current_user),
+    db: OrmSession = Depends(get_db),
+) -> dict:
+    """把会话从 PostgreSQL 重建到安全等待点。
+
+    什么时候需要它：提交回答返回 `STATE_RECOVERY_REQUIRED`（图位置与记录对不上），
+    或者 Redis 里的执行状态丢了。恢复会拿会话锁、对账未完成提交，并对
+    已有评分的回答补齐裁决与快照——不会重新评分，也不会越过当前题。
+    """
+    session = _owned_session(db, session_id, visitor, user)
+    result = recover_session(
+        db=db,
+        restore_graph=graph_runtime.get_compiled_graph(restore=True),
+        session=session,
+    )
+    return result
 
 
 @router.get("/{session_id}/current-question", summary="获取当前题（不推进）")

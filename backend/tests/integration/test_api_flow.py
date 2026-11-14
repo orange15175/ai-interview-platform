@@ -445,3 +445,121 @@ def test_jd_file_and_text_mutex(client):
         },
     )
     assert r2.status_code == 422
+
+
+def test_jd_text_too_short_rejected_before_202(client):
+    """JD 填太短必须当场 422：不能先 202 再在后台炸掉整场面试。"""
+    r = _create_interview(client, count="2", jd_text="后端")
+    assert r.status_code == 422
+    body = r.json()
+    assert body["code"] == "INVALID_JD_TEXT"
+    assert "至少" in body["message"]
+
+    # 校验没通过就不该建会话（否则用户会看到一个永远失败的幽灵会话）
+    token = client.cookies.get("aiiv_visitor")
+    db = get_session_factory()()
+    try:
+        visitor = visitors_repo.find_by_token(db, token)
+        rows = list(db.scalars(
+            select(InterviewSession).where(InterviewSession.owner_id == visitor.id)
+        ))
+        assert rows == []
+    finally:
+        db.close()
+
+
+def test_blank_jd_text_is_treated_as_absent(client):
+    """只填空格等于没填：按"未提供 JD"处理，不报错。"""
+    r = _create_interview(client, count="2", jd_text="    ")
+    assert r.status_code == 202
+    sid = r.json()["session_id"]
+    assert client.get(f"/api/interviews/{sid}").status_code == 200
+
+
+def test_retry_preparation_reuses_saved_materials(client, monkeypatch):
+    """出题失败后重试：只重新出题，不重新解析、不要求重传简历。"""
+    sid = _create_interview(client, count="2").json()["session_id"]
+
+    # 模拟"材料已存、出题失败"：题目与图都不存在，会话落成 PREPARATION_FAILED
+    db = get_session_factory()()
+    try:
+        db.execute(sa_delete(InterviewAnswer).where(
+            InterviewAnswer.session_id == uuid.UUID(sid)))
+        db.execute(sa_delete(InterviewQuestion).where(
+            InterviewQuestion.session_id == uuid.UUID(sid)))
+        db.execute(
+            sa_update(InterviewSession)
+            .where(InterviewSession.id == uuid.UUID(sid))
+            .values(
+                status="PREPARATION_FAILED",
+                current_question_id=None,
+                progress={"stage": "PREPARATION_FAILED",
+                          "failed_stage": "GENERATING_QUESTIONS",
+                          "retry_count": 0},
+            )
+        )
+        db.commit()
+        materials = list(db.scalars(
+            select(InterviewMaterial).where(InterviewMaterial.session_id == uuid.UUID(sid))
+        ))
+        assert len(materials) == 1  # 材料确实存住了
+    finally:
+        db.close()
+
+    # 出题失败时图从未启动过：把首次创建留下的 thread 删掉，才是真实状态
+    try:
+        get_checkpointer().delete_thread(sid)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 一旦重新解析就报错，证明重试路径没有调用解析模型
+    import app.agents.parse_agent as parse_agent
+
+    def boom(*args, **kwargs):
+        raise AssertionError("重试出题不应重新解析材料")
+
+    monkeypatch.setattr(parse_agent, "parse_materials", boom)
+
+    r = client.post(f"/api/interviews/{sid}/retry-preparation")
+    assert r.status_code == 202
+    assert r.json()["retry_count"] == 1
+
+    view = client.get(f"/api/interviews/{sid}").json()
+    assert view["status"] == "IN_PROGRESS"
+    assert view["current_question"] is not None
+    assert view["progress"]["stage"] == "WAITING_ANSWER"
+
+
+def test_retry_preparation_without_materials_asks_for_reupload(client):
+    """解析阶段就失败（材料没存）：重试没有意义，必须让用户重新上传。"""
+    sid = _create_interview(client, count="2").json()["session_id"]
+
+    db = get_session_factory()()
+    try:
+        db.execute(sa_delete(InterviewMaterial).where(
+            InterviewMaterial.session_id == uuid.UUID(sid)))
+        db.execute(sa_delete(InterviewAnswer).where(
+            InterviewAnswer.session_id == uuid.UUID(sid)))
+        db.execute(sa_delete(InterviewQuestion).where(
+            InterviewQuestion.session_id == uuid.UUID(sid)))
+        db.execute(
+            sa_update(InterviewSession)
+            .where(InterviewSession.id == uuid.UUID(sid))
+            .values(status="PREPARATION_FAILED",
+                    progress={"stage": "PREPARATION_FAILED",
+                              "failed_stage": "PARSING_MATERIAL"})
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    r = client.post(f"/api/interviews/{sid}/retry-preparation")
+    assert r.status_code == 409
+    assert r.json()["code"] == "MATERIAL_MISSING"
+
+
+def test_retry_preparation_rejects_non_failed_session(client):
+    sid = _create_interview(client, count="2").json()["session_id"]
+    r = client.post(f"/api/interviews/{sid}/retry-preparation")
+    assert r.status_code == 409
+    assert r.json()["code"] == "INVALID_STATE"

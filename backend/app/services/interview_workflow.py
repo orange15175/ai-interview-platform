@@ -4,24 +4,25 @@
 API 层（阶段 5）拿到 session_id/visitor_id 后调用这里；CLI 与测试也调这里。
 
 提交回答的 8 步（对应 §9.3）：
-1. 校验归属与终态；2. 幂等判定（replay/conflict/resume/proceed）；
-3. 拿会话锁，锁内**重新读取**最新状态并再次幂等检查；
-4. 短事务登记回答（PENDING），唯一约束防重复；
-5. 恢复图执行评分/规则/追问（模型调用不在事务里）；
-6. 阶段结果幂等写库（评分→裁决→响应快照）；
-7. CAS 递增 state_version，更新当前题与进度；
-8. 写 Redis 幂等缓存，释放锁，返回结果。
+1. 归属与题目校验；2. **幂等判定优先**（replay/conflict）——即使会话已结束也要
+   先回放；3. 终态检查；4. 拿会话锁，锁内重新读取并再次幂等检查；
+5. 短事务登记回答（PENDING）并记下图当前位置；6. 恢复图执行评分/规则/追问
+   （模型调用不在事务里）；7. 阶段结果幂等写库（评分→裁决→响应快照）；
+8. CAS 递增 state_version，写 Redis 幂等缓存，释放锁。
 
 跨存储不一致的处理口径（§9.3 末段，必须诚实）：
-- 图已推进、DB 未写 → 同一 request_id 重试走 resume 分支，从图状态里
-  把评分/裁决**读出来补写**，不重复调模型；
+- 图已推进、DB 未写 → 同一 request_id 重试**只补写**数据库与快照，绝不把旧
+  回答再喂给下一题（那会直接吃掉一道题）；
+- 节点失败（无 pending interrupt）→ continue_run，只重跑失败节点；
 - DB 已写、checkpoint 丢 → 走恢复入口从 PG 重建（recovery.py）；
-- 锁在写库前丢失 → 抛 VERSION_CONFLICT，绝不带病写入，交给恢复对账。
+- 锁在写库前丢失 → 抛 VERSION_CONFLICT，绝不带病写入，交给恢复对账；
+- 对不上账（图里找不到这次回答的结果）→ STATE_RECOVERY_REQUIRED，不猜分数。
 """
 
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -210,12 +211,17 @@ def submit_answer(
 
     user_id：登录用户身份（可选）。带上它就允许"换浏览器重新登录后继续答"，
     不带则只认匿名访客 Cookie，行为与之前完全一致。
+
+    **顺序是有意的**（开发说明 §一 第 2 条）：
+    归属校验 → 题目校验 → 幂等判定（回放/冲突）→ 终态检查。
+    幂等回放必须排在终态检查**之前**：最后一题提交成功但响应丢失时，会话
+    已经是 FINISHED，若先查终态就会把"我要拿回上一次的结果"变成
+    SESSION_FINISHED，用户永远拿不回那份评分。
     """
     if not request_id or len(request_id) > 64:
         raise RequestConflictError("request_id 缺失或过长（<=64 字符）")
 
     session = sessions_repo.get_owned(db, session_id, owner_id, user_id=user_id)
-    sessions_repo.assert_can_answer(session)
 
     question = questions_repo.get(db, question_id)
     if question is None or question.session_id != session.id:
@@ -231,6 +237,9 @@ def submit_answer(
         raise RequestConflictError(check.reason)
     if check.action == "replay":
         return _replay_response(db, session.id, request_id, redis_client)
+
+    # 到这里一定是"要真正处理"（新提交或续跑），终态检查才有意义
+    sessions_repo.assert_can_answer(session)
 
     lock = locks.acquire(str(session.id))
     lock.start_auto_renew()
@@ -328,6 +337,60 @@ def _register_new_answer(
     return row
 
 
+@dataclass(frozen=True)
+class AnswerPosition:
+    """这条回答在整场面试题序里的位置（对账用）。
+
+    index：第几条回答（0 基，按题目顺序）。图的 evaluations 列表就是按这个
+    顺序追加的，所以 index 是"从图状态里取回这次评分"的唯一键——不能像以前
+    那样盲取 evaluations[-1]：图可能已经推进到下一题，最后一个元素是别人的。
+    """
+
+    main_index: int
+    follow_up_index: int
+    index: int
+    completed_before: int
+
+    @property
+    def coords(self) -> tuple[int, int]:
+        return (self.main_index, self.follow_up_index)
+
+
+def _answer_position(
+    db: OrmSession, session_id: uuid.UUID, question
+) -> AnswerPosition:
+    """按题序算出这条回答的位置，以及它之前已经完成的回答条数。"""
+    ordered = questions_repo.list_for_session(db, session_id)
+    ordered.sort(key=lambda q: (q.main_index, q.follow_up_index))
+    index = next(
+        (i for i, q in enumerate(ordered) if q.id == question.id), None
+    )
+    if index is None:
+        raise StateRecoveryRequiredError("题目不在该会话的题序里，无法对账")
+
+    answers = {a.question_id: a for a in answers_repo.list_for_session(db, session_id)}
+    completed_before = sum(
+        1
+        for q in ordered[:index]
+        if (a := answers.get(q.id)) is not None and a.processing_status == "COMPLETED"
+    )
+    return AnswerPosition(
+        main_index=question.main_index,
+        follow_up_index=question.follow_up_index,
+        index=index,
+        completed_before=completed_before,
+    )
+
+
+def _stage_result(values: dict, index: int) -> tuple[dict | None, dict | None]:
+    """从图状态里按位置取本次回答的评分与裁决（越界返回 None，不猜）。"""
+    evaluations = values.get("evaluations") or []
+    decisions = values.get("followup_decisions") or []
+    evaluation = evaluations[index] if 0 <= index < len(evaluations) else None
+    decision = decisions[index] if 0 <= index < len(decisions) else None
+    return evaluation, decision
+
+
 def _run_and_persist(
     *,
     db: OrmSession,
@@ -341,8 +404,19 @@ def _run_and_persist(
     is_retry: bool,
     redis_client,
 ) -> dict:
-    """跑图 + 落阶段结果 + CAS 推进版本。模型调用不放在数据库事务里。"""
-    if not graph_runtime.has_checkpoint(graph, session.id):
+    """跑图 + 落阶段结果 + CAS 推进版本。模型调用不放在数据库事务里。
+
+    这里最要紧的一件事：**先对账，再决定跑不跑**。
+    以前只要"没有 pending interrupt"就 continue_run，于是"图已经推进到下一题、
+    数据库没写上"的重试会把旧回答喂给下一题（跳题）。现在按图的真实位置分四种：
+    - 停在等待点且等的就是这一题  → 正常 resume；
+    - 停在等待点但等的是别的题    → 图已消费过这次回答，只补写，绝不重投；
+    - 节点失败（无 interrupt）    → continue_run，只重跑失败节点（评分不重算）；
+    - 图已跑完                    → 只补写最终响应；
+    - 没有 checkpoint             → STATE_RECOVERY_REQUIRED。
+    """
+    snap = graph_runtime.snapshot(graph, session.id)
+    if snap.stage == graph_runtime.GRAPH_MISSING:
         answers_repo.fail(
             db, answer_row, code="STATE_RECOVERY_REQUIRED",
             message="执行状态缺失，需要从记录恢复",
@@ -350,35 +424,126 @@ def _run_and_persist(
         db.commit()
         raise StateRecoveryRequiredError()
 
+    position = _answer_position(db, session.id, question)
+
     answers_repo.mark_stage(db, answer_row, "GRAPH_RUNNING")
+    # 记下"处理前图在哪"：这次重试能不能重投，全靠它和当前快照对比
+    answers_repo.record_graph_position(
+        db,
+        answer_row,
+        stage=snap.stage,
+        wait_question_id=_wait_question_id(db, session.id, snap),
+    )
     db.commit()
 
-    _, _, waiting = graph_runtime.snapshot_state(graph, session.id)
-    if not waiting and not is_retry:
-        # 图不在等待点却来了新回答：执行位置与记录已不一致，
-        # 继续跑只会把回答丢掉，不如明确要求恢复（§9.4）。
+    if snap.stage == graph_runtime.GRAPH_WAITING:
+        verdict = snap.waits_for(*position.coords)
+        if verdict is True:
+            payload_in = {"skipped": True} if skipped else {"answer": answer or ""}
+            try:
+                result = graph_runtime.resume_answer(graph, session.id, payload_in)
+            except AppError as exc:
+                _persist_partial(db, graph, session, answer_row, position, exc)
+                raise
+            return _persist_success(
+                db=db, graph=graph, lock=lock, session=session,
+                answer_row=answer_row, position=position, result=result,
+                redis_client=redis_client,
+            )
+
+        if verdict is False and is_retry:
+            # 图已经推进过：这次回答早被消费了，只能把数据库和快照补齐
+            log.warning(
+                "会话 %s 检测到图已推进（等 %s.%s，本条为 %s.%s），改为补写不重投",
+                session.id, snap.wait_main_index, snap.wait_follow_up_index,
+                position.main_index, position.follow_up_index,
+            )
+            return _rebuild_from_state(
+                db=db, graph=graph, lock=lock, session=session,
+                answer_row=answer_row, position=position, snap=snap,
+                redis_client=redis_client,
+            )
+
+        # 首次提交却与图位置不符（或 payload 缺坐标）：不猜，交恢复流程
         answers_repo.fail(
             db, answer_row, code="STATE_RECOVERY_REQUIRED",
-            message="执行位置异常，需要恢复会话",
+            message="执行位置与记录不一致，需要恢复会话",
         )
         db.commit()
-        raise StateRecoveryRequiredError("会话执行位置异常，请先恢复会话")
+        raise StateRecoveryRequiredError("会话执行位置与记录不一致，请先恢复会话")
 
-    try:
-        if waiting:
-            payload_in = {"skipped": True} if skipped else {"answer": answer or ""}
-            result = graph_runtime.resume_answer(graph, session.id, payload_in)
-        else:
-            # 该请求上次在节点里失败（没有 pending interrupt）：从断点继续，
-            # 已完成的评分不会被重跑（LangGraph 只重跑失败节点）。
+    if snap.stage == graph_runtime.GRAPH_NODE_FAILED:
+        # 节点失败：从断点继续。LangGraph 只重跑失败节点，已完成的评分不会重算。
+        try:
             result = graph_runtime.continue_run(graph, session.id)
-    except AppError as exc:
-        _persist_partial(db, graph, session, answer_row, exc)
-        raise
+        except AppError as exc:
+            _persist_partial(db, graph, session, answer_row, position, exc)
+            raise
+        return _persist_success(
+            db=db, graph=graph, lock=lock, session=session,
+            answer_row=answer_row, position=position, result=result,
+            redis_client=redis_client,
+        )
 
-    return _persist_success(
-        db=db, graph=graph, lock=lock, session=session, answer_row=answer_row,
-        result=result, redis_client=redis_client,
+    if is_retry:
+        # 图已跑完（无 next、无 interrupt）：只补写数据库与快照
+        return _rebuild_from_state(
+            db=db, graph=graph, lock=lock, session=session,
+            answer_row=answer_row, position=position, snap=snap,
+            redis_client=redis_client,
+        )
+
+    answers_repo.fail(
+        db, answer_row, code="STATE_RECOVERY_REQUIRED",
+        message="执行位置异常，需要恢复会话",
+    )
+    db.commit()
+    raise StateRecoveryRequiredError("会话执行位置异常，请先恢复会话")
+
+
+def _wait_question_id(
+    db: OrmSession, session_id: uuid.UUID, snap: graph_runtime.GraphSnapshot
+) -> uuid.UUID | None:
+    """把中断里的 (主问题, 追问) 坐标翻成数据库题目 id（查不到返回 None）。"""
+    if snap.wait_main_index is None or snap.wait_follow_up_index is None:
+        return None
+    row = questions_repo.get_by_index(
+        db, session_id, snap.wait_main_index, snap.wait_follow_up_index
+    )
+    return row.id if row is not None else None
+
+
+def _rebuild_from_state(
+    *,
+    db: OrmSession,
+    graph: CompiledStateGraph,
+    lock: locks.SessionLock,
+    session: InterviewSession,
+    answer_row: InterviewAnswer,
+    position: AnswerPosition,
+    snap: graph_runtime.GraphSnapshot,
+    redis_client,
+) -> dict:
+    """图已消费过这次回答，但数据库没写全：从图状态补齐，**不重投旧回答**。
+
+    校验很硬：图状态里必须真的存在"第 index 条评分"。缺了就是不匹配，
+    宁可要求恢复，也不凭空编一个分数。
+    """
+    values = snap.values
+    evaluations = values.get("evaluations") or []
+    if position.completed_before >= len(evaluations):
+        answers_repo.fail(
+            db, answer_row, code="STATE_RECOVERY_REQUIRED",
+            message="图状态里找不到本次回答的结果，需要恢复会话",
+        )
+        db.commit()
+        raise StateRecoveryRequiredError("图状态与记录无法对账，请先恢复会话")
+
+    payload = snap.interrupt if snap.stage == graph_runtime.GRAPH_WAITING else None
+    return _finalize(
+        db=db, graph=graph, lock=lock, session=session,
+        answer_row=answer_row, position=position, values=values, payload=payload,
+        redis_client=redis_client, rebuilt=True,
     )
 
 
@@ -387,11 +552,13 @@ def _persist_partial(
     graph: CompiledStateGraph,
     session: InterviewSession,
     answer_row: InterviewAnswer,
+    position: AnswerPosition,
     exc: AppError,
 ) -> None:
     """失败也要把已成功的阶段写下来，供重试/恢复复用（§9.3 第 6 条）。"""
     values, _, _ = graph_runtime.snapshot_state(graph, session.id)
-    _save_stage_results(db, answer_row, values)
+    evaluation, decision = _stage_result(values, position.index)
+    _save_stage_results(db, answer_row, evaluation=evaluation, decision=decision)
     answers_repo.fail(db, answer_row, code=exc.code, message=exc.message)
     try:
         sessions_repo.bump_state_version(db, session)
@@ -403,13 +570,14 @@ def _persist_partial(
     )
 
 
-def _save_stage_results(db: OrmSession, answer_row: InterviewAnswer, values: dict) -> None:
-    """把图状态里的评分/裁决写进回答行（幂等：只写最近一条）。"""
-    evaluations = values.get("evaluations") or []
-    decisions = values.get("followup_decisions") or []
-    evaluation = evaluations[-1] if evaluations else None
-    decision = decisions[-1] if decisions else None
-
+def _save_stage_results(
+    db: OrmSession,
+    answer_row: InterviewAnswer,
+    *,
+    evaluation: dict | None,
+    decision: dict | None,
+) -> None:
+    """把图状态里的评分/裁决写进回答行（幂等：同样的值重复写不会变）。"""
     if evaluation is not None or answer_row.evaluation is None:
         score = evaluation.get("score") if isinstance(evaluation, dict) else None
         answers_repo.save_evaluation(db, answer_row, evaluation=evaluation, score=score)
@@ -424,15 +592,38 @@ def _persist_success(
     lock: locks.SessionLock,
     session: InterviewSession,
     answer_row: InterviewAnswer,
+    position: AnswerPosition,
     result: Any,
     redis_client,
 ) -> dict:
-    """成功路径：阶段结果落库 → 下一题落库 → CAS → 快照 → 返回。"""
+    """跑图成功：交给 _finalize 落库（与"补写"共用同一条收尾路径）。"""
     values = result if isinstance(result, dict) else {}
     payload = graph_runtime.interrupt_payload(result)
-    finished = payload is None
+    return _finalize(
+        db=db, graph=graph, lock=lock, session=session,
+        answer_row=answer_row, position=position, values=values, payload=payload,
+        redis_client=redis_client, rebuilt=False,
+    )
 
-    _save_stage_results(db, answer_row, values)
+
+def _finalize(
+    *,
+    db: OrmSession,
+    graph: CompiledStateGraph,
+    lock: locks.SessionLock,
+    session: InterviewSession,
+    answer_row: InterviewAnswer,
+    position: AnswerPosition,
+    values: dict,
+    payload: dict | None,
+    redis_client,
+    rebuilt: bool,
+) -> dict:
+    """成功收尾：阶段结果 → 下一题落库 → 锁检查 → CAS → 快照 → 缓存。"""
+    finished = payload is None
+    evaluation, decision = _stage_result(values, position.index)
+
+    _save_stage_results(db, answer_row, evaluation=evaluation, decision=decision)
     next_view = _next_question_payload(db, session.id, payload, values)
 
     # 写库前检查锁：租约失效说明可能已有别的请求接管，不能带病写入（§9.2）
@@ -451,8 +642,6 @@ def _persist_success(
         finished=finished,
     )
 
-    decision = (values.get("followup_decisions") or [None])[-1]
-    evaluation = (values.get("evaluations") or [None])[-1]
     response = {
         "answer_id": str(answer_row.id),
         "question_id": str(answer_row.question_id),
@@ -463,14 +652,20 @@ def _persist_success(
         "state_version": new_version,
         "replayed": False,
     }
-    answers_repo.complete(db, answer_row, response_snapshot=response, result_state_version=new_version)
+    if rebuilt:
+        response["rebuilt"] = True
+
+    answers_repo.complete(
+        db, answer_row, response_snapshot=response, result_state_version=new_version
+    )
     db.commit()
 
     idempotency.put_cached(redis_client, session.id, answer_row.request_id, response)
     log.info(
-        "会话 %s 提交完成 answer=%s next=%s finished=%s v=%d",
+        "会话 %s 提交完成 answer=%s next=%s finished=%s v=%d%s",
         session.id, answer_row.id,
         (next_view or {}).get("main_index"), finished, new_version,
+        "（由图状态补写）" if rebuilt else "",
     )
     return response
 

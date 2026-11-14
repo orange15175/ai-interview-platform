@@ -28,10 +28,30 @@ class AppError(Exception):
 
 
 class MaterialInsufficientError(AppError):
-    """材料内容不足，无法出题。要求用户补充，而不是硬编题目。"""
+    """材料读出来了，但内容不足以出题（没有教育/经历/项目）。
+
+    要求用户补充，而不是硬编题目。
+    """
+
+    code = "MATERIAL_INSUFFICIENT"
+    http_status = 422
+
+    def __init__(self, message: str = "简历内容不足，无法出题，请换一份内容完整的简历"):
+        super().__init__(message)
+
+
+class UnreadableMaterialError(MaterialInsufficientError):
+    """材料根本读不出来（空文档 / 损坏 / 完全没有可识别内容）。
+
+    与 MATERIAL_INSUFFICIENT 的区别必须保留：一个是"文件没内容"，一个是
+    "读出来了但没有经历可问"。混成一条错误码，用户不知道该换文件还是补内容。
+    继承同一个基类，是为了让"材料有问题"的统一捕获仍然有效。
+    """
 
     code = "UNREADABLE_MATERIAL"
-    http_status = 422
+
+    def __init__(self, message: str = "没有可解析的材料，请重新上传简历"):
+        super().__init__(message)
 
 
 class ModelCallError(AppError):
@@ -40,8 +60,35 @@ class ModelCallError(AppError):
     code = "MODEL_TIMEOUT"
     http_status = 502
 
-    def __init__(self, message: str = "模型服务暂时不可用，请稍后重试"):
-        super().__init__(message, retryable=True)
+    def __init__(self, message: str = "模型服务暂时不可用，请稍后重试",
+                 *, code: str | None = None):
+        super().__init__(message, retryable=True, code=code)
+
+
+class ModelTimeoutError(ModelCallError):
+    """模型调用超时（客户端 read timeout / 请求超时）。"""
+
+    code = "MODEL_TIMEOUT"
+
+
+class ModelUnavailableError(ModelCallError):
+    """模型服务不可用（连接失败 / 限流 / 供应商 5xx）。"""
+
+    code = "MODEL_UNAVAILABLE"
+
+
+def classify_model_exception(exc: BaseException, *, message: str) -> ModelCallError:
+    """把供应商/网络异常归类成稳定错误码。
+
+    超时与"服务不可用"对用户是两件事：前者重试往往就好，后者要等运维。
+    但对调用方都必须是可重试错误，绝不能变成 0 分。
+    """
+    name = type(exc).__name__.lower()
+    text = str(exc).lower()
+    timeout_markers = ("timeout", "timedout", "readtimeout", "apitimeouterror")
+    if any(m in name for m in timeout_markers) or "timed out" in text or "超时" in text:
+        return ModelTimeoutError(message)
+    return ModelUnavailableError(message)
 
 
 class ModelOutputInvalidError(AppError):
