@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -18,7 +19,12 @@ from sqlalchemy import and_, select, update
 from sqlalchemy.orm import Session as OrmSession
 
 from app.core.config import get_settings
-from app.core.errors import SessionFinishedError, SessionNotFoundError, VersionConflictError
+from app.core.errors import (
+    SessionFinishedError,
+    SessionNotFoundError,
+    VersionConflictError,
+    WriteFenceLostError,
+)
 from app.models import InterviewSession
 from app.models.base import utcnow
 
@@ -173,29 +179,120 @@ def touch(
     return session
 
 
-def bump_state_version(
-    db: OrmSession, session: InterviewSession, *, expected: int | None = None
-) -> int:
-    """CAS 递增版本号：`UPDATE ... WHERE state_version = expected`。
+def _is_postgres(db: OrmSession) -> bool:
+    return db.bind is not None and db.bind.dialect.name == "postgresql"
 
-    返回新版本号；rowcount 为 0 说明有人抢先推进了 → VersionConflictError。
+
+@dataclass(frozen=True)
+class WriteFence:
+    """本次请求的写入资格（拿锁之后、调模型之前取得）。
+
+    epoch：拿到锁时递增到的代次。此后只要有人接管了锁，epoch 就会更大，
+    我用旧 epoch 去写就影响 0 行 → 拒绝。
+    state_version：取得栅栏那一刻的业务状态版本，写入时一并比对。
+    """
+
+    epoch: int
+    state_version: int
+
+    def covers(self, session: InterviewSession) -> bool:
+        return session.write_epoch == self.epoch
+
+
+def begin_write(db: OrmSession, session: InterviewSession) -> WriteFence:
+    """取得写入资格：行锁内递增 write_epoch，读出 state_version，**立刻提交**。
+
+    为什么必须马上提交：模型调用动辄几十秒，把数据库行锁带进模型调用等于
+    让整场面试排队等一个外部 HTTP 请求。这里只做一次极短的读改写，
+    真正的写入保护靠后面带条件的 UPDATE（见 bump_state_version 的 fence 参数）。
+
+    也正因为它短，"锁已拿到但 epoch 没来得及递增"的窗口极小；即便撞上，
+    条件更新也会让其中一方影响 0 行，不会两份结果都落库。
+    """
+    if _is_postgres(db):
+        # 先拿行锁再读改写，避免两个接管者同时读到同一个 epoch 各自 +1
+        db.execute(
+            select(InterviewSession.id)
+            .where(InterviewSession.id == session.id)
+            .with_for_update()
+        )
+    db.execute(
+        update(InterviewSession)
+        .where(InterviewSession.id == session.id)
+        .values(write_epoch=InterviewSession.write_epoch + 1)
+        .execution_options(synchronize_session=False)
+    )
+    db.expire(session, ["write_epoch", "state_version"])
+    epoch = int(session.write_epoch or 0)
+    version = int(session.state_version or 0)
+    db.commit()  # 短事务到此为止，后面是模型调用，不许再占着行锁
+    return WriteFence(epoch=epoch, state_version=version)
+
+
+def check_fence(session: InterviewSession, fence: WriteFence | None) -> None:
+    """写入前的快速自检（真正的闸仍是数据库条件更新）。
+
+    这里拦的是"我自己都知道已经丢了"的情况：早点报错，别等跑完模型、
+    写完半张表再回滚。
+    """
+    if fence is not None and not fence.covers(session):
+        raise WriteFenceLostError()
+
+
+def bump_state_version(
+    db: OrmSession,
+    session: InterviewSession,
+    *,
+    expected: int | None = None,
+    fence: WriteFence | None = None,
+) -> int:
+    """CAS 递增版本号：`UPDATE ... WHERE state_version = expected [AND write_epoch = epoch]`。
+
+    返回新版本号；rowcount 为 0 → 拒绝写入并回滚（区分是丢了写入资格还是
+    状态被别人推进，见 _reject_write）。
     不要改成"读出来 +1 再写"：两个 worker 会同时读到同一个值，双双写成功。
+
+    fence 非空时同时校验 write_epoch —— 两道条件缺一不可：
+    只比 state_version，两个请求都读到 v=1 时会各自写 v=2，后者覆盖前者；
+    只比 write_epoch，同一持有者内部的重复推进（重放）拦不住。
     """
     current = session.state_version if expected is None else expected
     new_version = current + 1
+    conditions = [
+        InterviewSession.id == session.id,
+        InterviewSession.state_version == current,
+    ]
+    if fence is not None:
+        conditions.append(InterviewSession.write_epoch == fence.epoch)
+
     result = db.execute(
         update(InterviewSession)
-        .where(
-            InterviewSession.id == session.id,
-            InterviewSession.state_version == current,
-        )
+        .where(*conditions)
         .values(state_version=new_version, last_activity_at=utcnow())
         .execution_options(synchronize_session=False)
     )
     if result.rowcount != 1:
-        raise VersionConflictError()
+        _reject_write(db, session, fence)
     session.state_version = new_version
     return new_version
+
+
+def _reject_write(
+    db: OrmSession, session: InterviewSession, fence: WriteFence | None
+) -> None:
+    """条件更新影响 0 行：判定是哪一层拦的，然后抛错。
+
+    这里**不**自己 rollback：回滚责任在调用方（它才知道这条事务里还有哪些
+    写入该一起丢掉）。这里只做一次只读回查——条件更新已经拿到行锁，
+    读到的就是当前已提交的值，拿它区分"丢了写入资格"和"状态被别人推进"。
+    """
+    row = db.execute(
+        select(InterviewSession.write_epoch, InterviewSession.state_version)
+        .where(InterviewSession.id == session.id)
+    ).one_or_none()
+    if fence is not None and row is not None and int(row[0] or 0) != fence.epoch:
+        raise WriteFenceLostError()
+    raise VersionConflictError()
 
 
 def mark_preparation_failed(

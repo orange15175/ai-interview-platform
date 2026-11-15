@@ -188,6 +188,23 @@ class VersionConflictError(AppError):
         super().__init__(message, retryable=True)
 
 
+class WriteFenceLostError(AppError):
+    """数据库写入代次（write_epoch）已变：本次请求的写入资格被接管者收回。
+
+    与 VERSION_CONFLICT 的区别必须保留，否则排查时看不出到底哪一层拦的：
+    - WRITE_FENCE_LOST：**另一个持有者**拿走了锁（epoch 已递增），我这个请求
+      从那一刻起就不该再写任何东西——哪怕我算出来的结果是对的；
+    - VERSION_CONFLICT：epoch 还是我的，但业务状态被别人推进过（同一持有者
+      内部的并发或重放），需要重新读状态而不是重新举手。
+    """
+
+    code = "WRITE_FENCE_LOST"
+    http_status = 409
+
+    def __init__(self, message: str = "本次处理已失去写入权限，请用同一请求编号重试"):
+        super().__init__(message, retryable=True)
+
+
 class StateRecoveryRequiredError(AppError):
     """Redis checkpoint 缺失/损坏，需要用恢复入口从 PostgreSQL 重建（§9.4）。
 

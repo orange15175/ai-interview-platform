@@ -15,9 +15,15 @@
     latest_answer           wait_answer 写；evaluate/build_followup 读
     answer_skipped          wait_answer 写；evaluate/decide 读
     evaluations             evaluate 追加（skipped 时记 None 项）
-    followup_decisions      decide/build_followup 追加
+    followup_decisions      decide 追加（**每题恰好一条**，与 evaluations 按下标对齐）
+    followup_failures       build_followup 生成失败时追加（不参与下标对齐）
     asked_contents          dispatch/build_followup 追加（去重依据）
     finished                advance 写
+
+一条容易踩的坑（已踩过）：followup_decisions 是**按下标对账**的列表——
+interview_workflow 用"第几条回答"去取"第几条裁决"。所以 build_followup 失败时
+绝对不能再往 followup_decisions 里塞一条：那会把后面所有题的裁决整体错位一格，
+表现是"第 3 题记录里写着第 2 题没追问的原因"。失败留痕走 followup_failures。
 """
 
 from __future__ import annotations
@@ -44,8 +50,15 @@ class InterviewGraphState(TypedDict, total=False):
 
     # 追加型：每题的评分记录（skipped 的题为 None）
     evaluations: Annotated[list[dict | None], operator.add]
-    # 追加型：每次追问裁决的留痕
+    # 追加型：每次追问裁决的留痕。**每题恰好一条**（下标与 evaluations 对齐），
+    # 供 interview_workflow 按题序取回本次裁决。
     followup_decisions: Annotated[list[dict], operator.add]
+    # 追加型：追问生成失败的留痕（可选环节的降级证据）。
+    # 刻意与 followup_decisions 分开：它不参与"第几条回答"的下标对账。
+    followup_failures: Annotated[list[dict], operator.add]
+    # 本次 build_followup 是否失败（非追加型，每次覆盖）；条件边靠它决定
+    # "跳过追问直接推进"还是"进入等待点追问"。
+    followup_build_failed: bool
     # 追加型：已问过的题干（含追问），追问 Agent 的去重依据
     asked_contents: Annotated[list[str], operator.add]
 

@@ -7,6 +7,9 @@
 - POST   /api/interviews/{id}/answers            提交回答/跳过（幂等编排见 interview_workflow）
 - POST   /api/interviews/{id}/finish             用户提前结束（幂等）
 - GET    /api/interviews/{id}/records            正式问答记录（不生成报告）
+- GET    /api/interviews/{id}/report             复盘报告（只读聚合，不调用模型）
+- POST   /api/interviews/{id}/retry-preparation  复用已存材料只重跑出题
+- POST   /api/interviews/{id}/recover            显式从 PostgreSQL 恢复会话
 
 两条诚实声明（§10，不得向用户隐瞒）：
 1. 准备任务是**进程内后台任务**：服务重启会让 PREPARING 会话变成孤儿。
@@ -42,7 +45,8 @@ from app.parsers.pipeline import build_parsed_input, validate_jd_text
 from app.repositories import answers as answers_repo
 from app.repositories import questions as questions_repo
 from app.repositories import sessions as sessions_repo
-from app.services import graph_runtime, interview_workflow, locks
+from app.schemas.report import InterviewReport
+from app.services import graph_runtime, interview_workflow, locks, reporting
 from app.services.recovery import recover_session
 
 log = get_logger(__name__)
@@ -730,6 +734,10 @@ def finish_interview(
                 "state_version": session.state_version,
                 "finished": True,
             }
+        # 提前结束也是一次会话写入：取得写入栅栏，别让一个锁已过期的旧请求
+        # 把别人刚恢复的面试"结束"掉。
+        fence = sessions_repo.begin_write(db, session)
+        sessions_repo.check_fence(session, fence)
         sessions_repo.touch(
             db,
             session,
@@ -739,7 +747,7 @@ def finish_interview(
             finished=True,
             progress={"stage": "FINISHED", "ended_by": "user"},
         )
-        sessions_repo.bump_state_version(db, session)
+        sessions_repo.bump_state_version(db, session, fence=fence)
         db.commit()
         log.info("会话 %s 被用户提前结束", session_id)
         return {
@@ -794,3 +802,40 @@ def get_records(
         "record_count": len(records),
         "records": records,
     }
+
+
+# ---------------------------------------------------------------- 复盘报告
+
+
+@router.get(
+    "/{session_id}/report",
+    response_model=InterviewReport,
+    summary="面试复盘报告（只读，不调用模型）",
+)
+def get_report(
+    session_id: str,
+    visitor: AnonymousVisitor = Depends(get_visitor),
+    user: User | None = Depends(get_current_user),
+    db: OrmSession = Depends(get_db),
+) -> InterviewReport:
+    """把已落库的评分聚合成复盘报告。
+
+    三条边界（§3）：
+    - **只读**：不调用任何模型，不改会话状态。同一份记录重复打开，结论一致。
+    - **不泄题**：evaluation 里的 rubric_results（评分要点）一律不出现在响应里。
+    - **不编数**：没有有效评分时 overall_score 为 null 并附说明，绝不用 0 分代替。
+
+    会话还在答题中也允许看：此时报告只覆盖已完成的题目，notice 会写明。
+    """
+    session = _owned_session(db, session_id, visitor, user)
+    if session.status == "PREPARING":
+        raise AppError(
+            "简历还在准备中，报告要等面试开始后才能生成",
+            code="PREPARING", http_status=409, retryable=True,
+        )
+
+    return reporting.build_report(
+        session=session,
+        questions=questions_repo.list_for_session(db, session.id),
+        answers=answers_repo.list_for_session(db, session.id),
+    )

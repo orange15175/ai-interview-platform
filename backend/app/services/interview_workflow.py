@@ -37,13 +37,15 @@ from app.core.errors import (
     StateRecoveryRequiredError,
     VersionConflictError,
 )
+from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.models import InterviewAnswer, InterviewSession
 from app.repositories import answers as answers_repo
 from app.repositories import questions as questions_repo
 from app.repositories import sessions as sessions_repo
+from app.schemas.followup import REASON_FOLLOWUP_FAILED
 from app.schemas.questions import GeneratedQuestion, QuestionSet
-from app.services import graph_runtime, idempotency, locks
+from app.services import compensation, graph_runtime, idempotency, locks
 
 log = get_logger(__name__)
 
@@ -75,6 +77,17 @@ def public_decision(decision: dict | None) -> dict | None:
     return {
         "decision": decision.get("decision"),
         "reason_code": decision.get("reason_code"),
+    }
+
+
+def public_degradation(answer_row) -> dict | None:
+    """降级信息的对外投影：只说"哪一层降级了、为什么"，不带内部提示词或分数。"""
+    level = getattr(answer_row, "degradation_level", None)
+    if not level:
+        return None
+    return {
+        "level": level,
+        "reason": (getattr(answer_row, "degradation_reason", None) or "")[:200] or None,
     }
 
 
@@ -166,6 +179,10 @@ def start_interview(
     state_values, _, _ = graph_runtime.snapshot_state(graph, session.id)
     view = _next_question_payload(db, session.id, payload, state_values)
 
+    # 启动也是一次会话写入：取得栅栏，版本推进必须带 epoch，
+    # 否则两个并发的"重试出题"能各自把同一场面试启动成两个不同的题序。
+    fence = sessions_repo.begin_write(db, session)
+    sessions_repo.check_fence(session, fence)
     sessions_repo.touch(
         db,
         session,
@@ -174,7 +191,7 @@ def start_interview(
         progress=_progress(state_values, payload, finished=False),
         started=True,
     )
-    sessions_repo.bump_state_version(db, session)
+    _bump_or_rollback(db, session, fence=fence)
     db.commit()
 
     log.info(
@@ -259,6 +276,11 @@ def submit_answer(
         if check.action == "replay":
             return _replay_response(db, session.id, request_id, redis_client)
 
+        # 写入资格：锁内递增 write_epoch，取得本次请求的 epoch。
+        # 从这一刻起，任何接管锁的请求都会让我的 epoch 过期；模型跑完后
+        # 带 epoch 的条件更新影响 0 行 → 我的结果一律不许落库。
+        fence = sessions_repo.begin_write(db, session)
+
         answer_row = (
             existing
             if check.action == "resume"
@@ -288,9 +310,50 @@ def submit_answer(
             skipped=skipped,
             is_retry=check.action == "resume",
             redis_client=redis_client,
+            fence=fence,
         )
     finally:
         lock.release()
+
+
+def resume_claimed_answer(
+    *,
+    db: OrmSession,
+    graph: CompiledStateGraph,
+    session: InterviewSession,
+    answer_row: InterviewAnswer,
+    lock: locks.SessionLock,
+    redis_client=None,
+) -> dict:
+    """后台补偿专用入口：把一条**已被抢占**的失败提交跑完。
+
+    与用户手动重试共用同一条收尾路径（_run_and_persist），差别只有两点：
+    1. 用的是数据库里存的原始回答与原始 request_id，绝不用新 id——
+       换 id 等于把"同一次提交"变成两次，会出现两个分数；
+    2. 会话锁由调用方拿好并传进来，因为 worker 需要在拿锁之后、
+       跑模型之前再确认一次"会话没有结束、这条回答还没完成"。
+
+    执行前必须重新取得写入栅栏：worker 排队等锁的这段时间里，
+    完全可能已经有别的执行者把这场面试推进了。
+    """
+    question = questions_repo.get(db, answer_row.question_id)
+    if question is None or question.session_id != session.id:
+        raise StateRecoveryRequiredError("回答所属题目已不存在，无法补偿")
+
+    fence = sessions_repo.begin_write(db, session)
+    return _run_and_persist(
+        db=db,
+        graph=graph,
+        lock=lock,
+        session=session,
+        question=question,
+        answer_row=answer_row,
+        answer=answer_row.answer_content if answer_row.submission_kind != "skip" else None,
+        skipped=answer_row.submission_kind == "skip",
+        is_retry=True,
+        redis_client=redis_client,
+        fence=fence,
+    )
 
 
 def _register_new_answer(
@@ -391,6 +454,23 @@ def _stage_result(values: dict, index: int) -> tuple[dict | None, dict | None]:
     return evaluation, decision
 
 
+def _followup_failure(values: dict, position: AnswerPosition) -> dict | None:
+    """这一题之后本该生成的那次追问失败了吗（追问是可选环节的降级证据）。
+
+    坐标用"被答完的题"（main_index, follow_up_index），而不是失败记录自己的
+    主/追对：失败的那个追问根本没生成，没有自己的坐标。
+    """
+    for item in values.get("followup_failures") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("main_index") != position.main_index:
+            continue
+        if int(item.get("answered_follow_up_index") or 0) != position.follow_up_index:
+            continue
+        return item
+    return None
+
+
 def _run_and_persist(
     *,
     db: OrmSession,
@@ -403,6 +483,7 @@ def _run_and_persist(
     skipped: bool,
     is_retry: bool,
     redis_client,
+    fence: sessions_repo.WriteFence | None = None,
 ) -> dict:
     """跑图 + 落阶段结果 + CAS 推进版本。模型调用不放在数据库事务里。
 
@@ -443,12 +524,12 @@ def _run_and_persist(
             try:
                 result = graph_runtime.resume_answer(graph, session.id, payload_in)
             except AppError as exc:
-                _persist_partial(db, graph, session, answer_row, position, exc)
+                _persist_partial(db, graph, session, answer_row, position, exc, fence=fence)
                 raise
             return _persist_success(
                 db=db, graph=graph, lock=lock, session=session,
                 answer_row=answer_row, position=position, result=result,
-                redis_client=redis_client,
+                redis_client=redis_client, fence=fence,
             )
 
         if verdict is False and is_retry:
@@ -461,7 +542,7 @@ def _run_and_persist(
             return _rebuild_from_state(
                 db=db, graph=graph, lock=lock, session=session,
                 answer_row=answer_row, position=position, snap=snap,
-                redis_client=redis_client,
+                redis_client=redis_client, fence=fence,
             )
 
         # 首次提交却与图位置不符（或 payload 缺坐标）：不猜，交恢复流程
@@ -477,12 +558,12 @@ def _run_and_persist(
         try:
             result = graph_runtime.continue_run(graph, session.id)
         except AppError as exc:
-            _persist_partial(db, graph, session, answer_row, position, exc)
+            _persist_partial(db, graph, session, answer_row, position, exc, fence=fence)
             raise
         return _persist_success(
             db=db, graph=graph, lock=lock, session=session,
             answer_row=answer_row, position=position, result=result,
-            redis_client=redis_client,
+            redis_client=redis_client, fence=fence,
         )
 
     if is_retry:
@@ -490,7 +571,7 @@ def _run_and_persist(
         return _rebuild_from_state(
             db=db, graph=graph, lock=lock, session=session,
             answer_row=answer_row, position=position, snap=snap,
-            redis_client=redis_client,
+            redis_client=redis_client, fence=fence,
         )
 
     answers_repo.fail(
@@ -523,6 +604,7 @@ def _rebuild_from_state(
     position: AnswerPosition,
     snap: graph_runtime.GraphSnapshot,
     redis_client,
+    fence: sessions_repo.WriteFence | None = None,
 ) -> dict:
     """图已消费过这次回答，但数据库没写全：从图状态补齐，**不重投旧回答**。
 
@@ -543,7 +625,7 @@ def _rebuild_from_state(
     return _finalize(
         db=db, graph=graph, lock=lock, session=session,
         answer_row=answer_row, position=position, values=values, payload=payload,
-        redis_client=redis_client, rebuilt=True,
+        redis_client=redis_client, rebuilt=True, fence=fence,
     )
 
 
@@ -554,19 +636,32 @@ def _persist_partial(
     answer_row: InterviewAnswer,
     position: AnswerPosition,
     exc: AppError,
+    *,
+    fence: sessions_repo.WriteFence | None = None,
 ) -> None:
-    """失败也要把已成功的阶段写下来，供重试/恢复复用（§9.3 第 6 条）。"""
+    """失败也要把已成功的阶段写下来，供重试/恢复复用（§9.3 第 6 条）。
+
+    这里的写入同样受写入栅栏约束：**失败**也是一种结论，一个丢了写入资格的
+    请求不该把"这条回答失败"的事实按在别人刚推进的会话上。
+    """
     values, _, _ = graph_runtime.snapshot_state(graph, session.id)
     evaluation, decision = _stage_result(values, position.index)
-    _save_stage_results(db, answer_row, evaluation=evaluation, decision=decision)
-    answers_repo.fail(db, answer_row, code=exc.code, message=exc.message)
+    _save_stage_results(
+        db, answer_row, evaluation=evaluation, decision=decision,
+        followup_failure=_followup_failure(values, position),
+    )
+    answers_repo.fail(
+        db, answer_row, code=exc.code, message=exc.message,
+        epoch=fence.epoch if fence else None,
+    )
     try:
-        sessions_repo.bump_state_version(db, session)
+        sessions_repo.bump_state_version(db, session, fence=fence)
         db.commit()
     except Exception:  # noqa: BLE001 —— 版本冲突时以记录为准，别掩盖原始错误
         db.rollback()
     log.warning(
-        "会话 %s 提交处理失败 code=%s answer=%s", session.id, exc.code, answer_row.id
+        "会话 %s 提交处理失败 code=%s answer=%s retryable=%s",
+        session.id, exc.code, answer_row.id, answer_row.retryable,
     )
 
 
@@ -576,13 +671,45 @@ def _save_stage_results(
     *,
     evaluation: dict | None,
     decision: dict | None,
+    followup_failure: dict | None = None,
 ) -> None:
     """把图状态里的评分/裁决写进回答行（幂等：同样的值重复写不会变）。"""
     if evaluation is not None or answer_row.evaluation is None:
         score = evaluation.get("score") if isinstance(evaluation, dict) else None
         answers_repo.save_evaluation(db, answer_row, evaluation=evaluation, score=score)
+        if evaluation is not None:
+            settings = get_settings()
+            answers_repo.record_evaluation_meta(
+                db, answer_row,
+                model_name=settings.text_model.model,
+                prompt_version="v1",
+            )
     if decision is not None:
         answers_repo.save_decision(db, answer_row, decision=decision)
+    # 追问失败是"降级"不是"失败"：分已经拿到了，只是少问一句。
+    # 必须留痕，否则复盘时"为什么这道题没有追问"永远无解。
+    if followup_failure is not None:
+        answers_repo.record_degradation(
+            db, answer_row,
+            level=compensation.DEGRADATION_FOLLOWUP_SKIPPED,
+            reason=followup_failure.get("detail") or "追问生成失败，已跳过追问",
+        )
+
+
+def _bump_or_rollback(
+    db: OrmSession, session: InterviewSession, *, fence: sessions_repo.WriteFence | None = None
+) -> int:
+    """CAS 推进版本；被拒（栅栏丢失/版本冲突）时先撤销本次写入再抛。
+
+    为什么必须有这一步：条件更新只拦住了**会话行**，回答行、追问题目行的
+    写入还在同一个事务里挂着。不回滚就 raise，调用方一旦 commit 就会留下
+    "评分写进去了、会话没推进"的半截状态——这正是恢复流程最讨厌的形态。
+    """
+    try:
+        return sessions_repo.bump_state_version(db, session, fence=fence)
+    except AppError:
+        db.rollback()
+        raise
 
 
 def _persist_success(
@@ -595,6 +722,7 @@ def _persist_success(
     position: AnswerPosition,
     result: Any,
     redis_client,
+    fence: sessions_repo.WriteFence | None = None,
 ) -> dict:
     """跑图成功：交给 _finalize 落库（与"补写"共用同一条收尾路径）。"""
     values = result if isinstance(result, dict) else {}
@@ -602,7 +730,7 @@ def _persist_success(
     return _finalize(
         db=db, graph=graph, lock=lock, session=session,
         answer_row=answer_row, position=position, values=values, payload=payload,
-        redis_client=redis_client, rebuilt=False,
+        redis_client=redis_client, rebuilt=False, fence=fence,
     )
 
 
@@ -618,12 +746,20 @@ def _finalize(
     payload: dict | None,
     redis_client,
     rebuilt: bool,
+    fence: sessions_repo.WriteFence | None = None,
 ) -> dict:
-    """成功收尾：阶段结果 → 下一题落库 → 锁检查 → CAS → 快照 → 缓存。"""
+    """成功收尾：阶段结果 → 下一题落库 → 锁/栅栏检查 → CAS → 快照 → 缓存。"""
     finished = payload is None
     evaluation, decision = _stage_result(values, position.index)
+    failure = _followup_failure(values, position)
 
-    _save_stage_results(db, answer_row, evaluation=evaluation, decision=decision)
+    # 栅栏自检放在**任何写入之前**：早失败早回滚，别写半张表再退回。
+    sessions_repo.check_fence(session, fence)
+
+    _save_stage_results(
+        db, answer_row, evaluation=evaluation, decision=decision,
+        followup_failure=failure,
+    )
     next_view = _next_question_payload(db, session.id, payload, values)
 
     # 写库前检查锁：租约失效说明可能已有别的请求接管，不能带病写入（§9.2）
@@ -631,7 +767,7 @@ def _finalize(
         db.rollback()
         raise VersionConflictError("会话锁已失效，本次结果未写入，请用同一 request_id 重试")
 
-    new_version = sessions_repo.bump_state_version(db, session)
+    new_version = _bump_or_rollback(db, session, fence=fence)
     sessions_repo.touch(
         db,
         session,
@@ -642,21 +778,32 @@ def _finalize(
         finished=finished,
     )
 
+    # 对外裁决要"实话实说"：规则链说该追问，但追问生成失败了、最终没问，
+    # 那对外就报 FOLLOWUP_FAILED（内部 rule_decision 保留规则链原判，供复盘）。
+    effective_decision = decision
+    if failure is not None:
+        effective_decision = {
+            "decision": "stop",
+            "reason_code": REASON_FOLLOWUP_FAILED,
+        }
+
     response = {
         "answer_id": str(answer_row.id),
         "question_id": str(answer_row.question_id),
         "evaluation": public_evaluation(evaluation),
-        "followup_decision": public_decision(decision),
+        "followup_decision": public_decision(effective_decision),
         "next_question": next_view,
         "finished": finished,
         "state_version": new_version,
         "replayed": False,
+        "degradation": public_degradation(answer_row),
     }
     if rebuilt:
         response["rebuilt"] = True
 
     answers_repo.complete(
-        db, answer_row, response_snapshot=response, result_state_version=new_version
+        db, answer_row, response_snapshot=response, result_state_version=new_version,
+        epoch=fence.epoch if fence else None,
     )
     db.commit()
 

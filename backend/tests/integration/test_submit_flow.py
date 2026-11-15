@@ -446,3 +446,102 @@ def test_answers_until_finished(env):
 
     with pytest.raises(SessionFinishedError):
         _submit(env, question_id=current["question_id"])
+
+
+# ---------------------------------------------------------------- 分层降级
+
+
+def test_followup_output_invalid_is_skipped_and_recorded(env, monkeypatch):
+    """追问输出非法 → 跳过追问进下一道主问题，并留下降级痕迹。
+
+    这是"可选体验降级"：分已经拿到了，只是少问一句。所以流程必须继续，
+    记录必须是 COMPLETED（不是 FAILED），但 degradation_level 要写下来，
+    否则"为什么这道题没有追问"永远查不出原因。
+    """
+    import app.graph.nodes as nodes
+    from app.core.errors import ModelOutputInvalidError
+
+    def bad_followup(*args, **kwargs):
+        raise ModelOutputInvalidError("追问输出不是合法结构")
+
+    monkeypatch.setattr(nodes, "generate_followup", bad_followup)
+
+    res = _submit(env)
+
+    assert res["followup_decision"]["reason_code"] == "FOLLOWUP_FAILED"
+    # 没有追问题，直接推进到下一道主问题（不重复问已回答过的题）
+    assert res["next_question"] is not None
+    assert res["next_question"]["kind"] == "main"
+    assert res["next_question"]["main_index"] == 2
+    assert res["degradation"]["level"] == "FOLLOWUP_SKIPPED"
+
+    row = answers_repo.get(env.db, res["answer_id"])
+    assert row.processing_status == "COMPLETED"
+    assert row.evaluation is not None  # 评分没丢
+    assert row.degradation_level == "FOLLOWUP_SKIPPED"
+    assert row.degradation_reason
+    assert row.retryable is False  # 降级不是失败，不该进补偿队列
+
+
+def test_evaluation_failure_keeps_answer_and_does_not_advance(env, monkeypatch):
+    """评分失败是核心结果缺失：保留回答、不产生分数、不推进下一题。"""
+    import app.graph.nodes as nodes
+    from app.core.errors import ModelCallError
+
+    def boom(*args, **kwargs):
+        raise ModelCallError("模型超时")
+
+    monkeypatch.setattr(nodes, "evaluate_answer", boom)
+
+    with pytest.raises(ModelCallError):
+        _submit(env, request_id="req-eval-fail")
+
+    row = answers_repo.get_by_request(env.db, env.session.id, "req-eval-fail")
+    assert row is not None
+    assert row.answer_content  # 用户原文保留，重试要用
+    assert row.processing_status == "FAILED"
+    assert row.score is None and row.evaluation is None  # 绝不用 0 分冒充答错
+    assert row.response_snapshot["error"]["code"] == "MODEL_TIMEOUT"
+    assert row.retryable is True  # 可被后台补偿接手
+    assert row.degradation_level == "EVALUATION_FAILED"
+    assert row.model_name is None
+
+    env.db.refresh(env.session)
+    assert env.session.status == "IN_PROGRESS"
+    # 关键：题号没有前进（失败不推进），当前题还是刚才那道
+    assert str(env.session.current_question_id) == env.started["question"]["question_id"]
+
+
+def test_late_write_after_lock_takeover_is_rejected(env, monkeypatch):
+    """模型调用期间锁被接管：本次结果一条都不许写（write_epoch 迟到写入）。
+
+    场景：A 拿了锁开始跑模型，租约期间 A 卡住；B 拿到锁推进了会话。
+    A 跑完回来时，它算出来的结果**即使是对的也不能落库**——一旦落库，
+    用户会看到"第 2 题刚答完，题号却被 B 撤销"的错乱。
+    """
+    from app.core.errors import WriteFenceLostError
+    from app.services import graph_runtime as gr
+
+    original = gr.resume_answer
+
+    def takeover(graph, session_id, payload):
+        result = original(graph, session_id, payload)
+        # B 接管：epoch 递增。A 的栅栏从此刻起作废。
+        sessions_repo.begin_write(env.db, env.session)
+        return result
+
+    monkeypatch.setattr(gr, "resume_answer", takeover)
+
+    with pytest.raises(WriteFenceLostError):
+        _submit(env, request_id="req-late")
+
+    # 回答没有被标成完成，也没有写响应快照
+    row = answers_repo.get_by_request(env.db, env.session.id, "req-late")
+    assert row is not None
+    assert row.processing_status != "COMPLETED"
+    assert row.score is None
+
+    # 会话没有被推进：题号还是第一题
+    env.db.refresh(env.session)
+    assert str(env.session.current_question_id) == env.started["question"]["question_id"]
+    assert env.session.state_version == 1

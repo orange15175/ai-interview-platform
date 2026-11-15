@@ -231,6 +231,8 @@ def test_visitor_isolation(stranger, client):
         f"/api/interviews/{sid}",
         f"/api/interviews/{sid}/current-question",
         f"/api/interviews/{sid}/records",
+        # 报告同样走归属校验：知道 session_id 也不能绕过权限（§3.1）
+        f"/api/interviews/{sid}/report",
     ):
         r = stranger.get(path)
         assert r.status_code == 404
@@ -563,3 +565,69 @@ def test_retry_preparation_rejects_non_failed_session(client):
     r = client.post(f"/api/interviews/{sid}/retry-preparation")
     assert r.status_code == 409
     assert r.json()["code"] == "INVALID_STATE"
+
+
+# ---------------------------------------------------------------- 复盘报告
+
+
+def _answer_all(client: TestClient, sid: str) -> list[dict]:
+    """答完所有题，返回每次提交的响应。"""
+    q = client.get(f"/api/interviews/{sid}/current-question").json()["question"]
+    out: list[dict] = []
+    for _ in range(8):
+        r = _submit(client, sid, _answer_body(q["question_id"]))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        out.append(body)
+        if body["finished"]:
+            break
+        q = body["next_question"]
+    return out
+
+
+def test_report_endpoint_returns_aggregates(client):
+    """真库端到端：答完题 → 报告给出总体分、五维、证据，且不含评分要点。"""
+    sid = _create_interview(client, count="2").json()["session_id"]
+    submissions = _answer_all(client, sid)
+    assert submissions[-1]["finished"] is True
+
+    r = client.get(f"/api/interviews/{sid}/report")
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    assert body["session_id"] == sid
+    assert body["is_final"] is True
+    assert body["summary"]["question_count"] == len(submissions)
+    assert body["summary"]["overall_score"] is not None
+    assert 0 <= body["summary"]["overall_score"] <= 100
+    assert body["summary"]["score_coverage"] > 0
+    assert body["evidence"], body
+    # 报告只是聚合：绝不把评分要点（rubric）带出去
+    assert "rubric" not in r.text
+    # 也不返回内部裁决 detail
+    assert "detail" not in r.text
+
+
+def test_report_is_read_only_and_repeatable(client):
+    """重复打开报告：结论一致，且不推进会话版本。"""
+    sid = _create_interview(client, count="2").json()["session_id"]
+    _answer_all(client, sid)
+
+    first = client.get(f"/api/interviews/{sid}/report").json()
+    view_before = client.get(f"/api/interviews/{sid}").json()
+    second = client.get(f"/api/interviews/{sid}/report").json()
+    view_after = client.get(f"/api/interviews/{sid}").json()
+
+    assert first["summary"] == second["summary"]
+    assert first["evidence"] == second["evidence"]
+    assert view_before["state_version"] == view_after["state_version"]
+
+
+def test_submit_response_reports_degradation_field(client):
+    """正常答题时 degradation 为空；字段存在，前端才好统一处理。"""
+    sid = _create_interview(client, count="2").json()["session_id"]
+    q = client.get(f"/api/interviews/{sid}/current-question").json()["question"]
+    out = _submit(client, sid, _answer_body(q["question_id"])).json()
+
+    assert "degradation" in out
+    assert out["degradation"] is None

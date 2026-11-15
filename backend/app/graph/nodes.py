@@ -208,9 +208,13 @@ def build_followup_node(state: InterviewGraphState) -> dict:
 
     失败策略（区别于评分）：
     - 模型服务不可用（ModelCallError）→ 抛出去让客户端重试；
-    - 修复后输出仍非法（ModelOutputInvalidError）→ 不死磕：记
-      FOLLOWup_FAILED 裁决后直接推进主流程。面试不能因为追问生成
+    - 修复后输出仍非法（ModelOutputInvalidError）→ 不死磕：记一条
+      followup_failures 留痕后直接推进主流程。面试不能因为追问生成
       失败而卡死——追问是增益项，不是必选项。
+
+    **失败绝不往 followup_decisions 里追加**：那个列表按下标与
+    evaluations 对齐（"第几条回答"取"第几条裁决"），多塞一条会让后面
+    所有题的裁决错位一格。留痕走独立的 followup_failures。
     """
     from app.schemas.evaluation import Evaluation
 
@@ -237,14 +241,17 @@ def build_followup_node(state: InterviewGraphState) -> dict:
             rule_version=RULE_VERSION,
             detail=f"追问生成失败：{str(exc)[:120]}",
         )
-        return {"followup_decisions": [{
-            "main_index": state.get("current_main_index", 1),
-            "decision": failed.decision,
-            "reason_code": failed.reason_code,
-            "rule_version": failed.rule_version,
-            "detail": failed.detail,
-            "target": "",
-        }]}
+        return {
+            "followup_failures": [{
+                "main_index": state.get("current_main_index", 1),
+                # 失败的是"这一题之后本该生成的那次追问"，按被答完的题记录坐标
+                "answered_follow_up_index": state.get("current_followup_index", 0),
+                "reason_code": failed.reason_code,
+                "rule_version": failed.rule_version,
+                "detail": failed.detail,
+            }],
+            "followup_build_failed": True,
+        }
 
     next_index = state.get("current_followup_index", 0) + 1
     followup_pending = {
@@ -262,21 +269,21 @@ def build_followup_node(state: InterviewGraphState) -> dict:
         "pending_question": followup_pending,
         "current_followup_index": next_index,
         "asked_contents": [fq.content],
+        "followup_build_failed": False,
     }
 
 
 def route_after_build_followup(state: InterviewGraphState) -> Literal["wait_answer", "advance"]:
-    """追问生成失败（FOLLOWUP_FAILED）时不能进等待点：
+    """追问生成失败时不能进等待点：
 
     pending_question 还停留在已答过的题目上，直接 wait_answer 会把
     同一道题再问一遍（候选人重答 → 重复评分 → 死循环隐患）。
     失败就放弃追问，直接推进主流程。
+
+    判定用 followup_build_failed（本次覆盖写），不再去翻
+    followup_decisions 的最后一条——那个列表已经不含失败记录了。
     """
-    decisions = state.get("followup_decisions", [])
-    last = decisions[-1] if decisions else None
-    if last and last.get("reason_code") == REASON_FOLLOWUP_FAILED:
-        return "advance"
-    return "wait_answer"
+    return "advance" if state.get("followup_build_failed") else "wait_answer"
 
 
 def advance_node(state: InterviewGraphState) -> dict:

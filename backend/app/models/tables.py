@@ -14,12 +14,16 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    BigInteger,
+    Boolean,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
     Uuid,
+    false,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 from app.models.base import JSONVar
@@ -105,6 +109,14 @@ class InterviewSession(Base):
     graph_version: Mapped[str] = mapped_column(String(32), default="v1")
     rule_version: Mapped[str] = mapped_column(String(32), default="v1")
 
+    # 数据库级写入代次（write_epoch）：回答"这次请求**还有没有**写入资格"。
+    # 与 state_version 是两个层次的语义，别混：
+    # - write_epoch → 锁被接管后旧请求作废（谁拿到锁谁递增）;
+    # - state_version → 业务状态是否仍是我期望的那一版（防止覆盖别人推进）。
+    # 只靠 state_version 拦不住"两边都读到同一个旧版本"的迟到写入；只靠 epoch
+    # 也拦不住"同一持有者内部"的状态覆盖。两道同时命中才允许落库。
+    write_epoch: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+
     # 恢复进度：受控 JSONB（§8 末段），阶段 4 的 recovery 专用重建依据
     progress: Mapped[dict] = mapped_column(JSONVar, default=dict)
 
@@ -169,6 +181,9 @@ class InterviewAnswer(Base):
         UniqueConstraint("session_id", "request_id", name="uq_answers_session_request"),
         # 首期每题只允许一次提交（§8；放开修改答案需先撤掉这条）
         UniqueConstraint("session_id", "question_id", name="uq_answers_session_question"),
+        # 后台补偿扫描的专用索引：先按状态，再按是否可重试，最后按到期时间。
+        # 列顺序不能换——扫描条件就是这三列的前缀，换顺序等于全表扫。
+        Index("ix_answers_retry_scan", "processing_status", "retryable", "next_retry_at"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
@@ -208,6 +223,29 @@ class InterviewAnswer(Base):
     # 乐观并发：请求带入期望版本，写入时校验（§9.2 CAS）
     expected_state_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     result_state_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # 写入代次快照：这一行是被哪一代请求写下去的（审计"迟到写入"用）。
+    # 仅作证据，判定写入资格的是会话行上的 write_epoch。
+    write_epoch: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    # ---------------- 失败提交的后台补偿 ----------------
+    # retryable=False 的行永远不会被扫描到：不可重试错误（材料不可读、请求非法）
+    # 重试一万次还是同一个结果，进队列只是白烧模型费用。
+    retryable: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    next_retry_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    # 后台补偿已尝试次数（决定退避档位）。刻意不复用 processing_attempt：
+    # 那个计数含用户手动重试，混在一起会让退避档位被手速带着跳。
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # 抢占标记：worker 崩溃后靠 claimed_at 超时把任务放回队列
+    claimed_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    claim_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # ---------------- 模型降级记录（§6.5） ----------------
+    # NONE / FOLLOWUP_SKIPPED（追问失败，跳过）/ EVALUATION_FAILED（评分失败，保留回答）
+    degradation_level: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    degradation_reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    model_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    prompt_version: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(nullable=True)

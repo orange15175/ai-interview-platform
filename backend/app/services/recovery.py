@@ -202,7 +202,8 @@ def _complete_evaluated(
         "rebuilt": True,
     }
     answers_repo.complete(
-        db, row, response_snapshot=snapshot, result_state_version=session.state_version
+        db, row, response_snapshot=snapshot, result_state_version=session.state_version,
+        epoch=session.write_epoch,
     )
     return True
 
@@ -247,6 +248,10 @@ def recover_session(
         if not mains:
             raise StateRecoveryRequiredError("会话没有题目记录，无法恢复，请重新创建面试")
 
+        # 恢复同样是写入：取得栅栏。之后所有对会话的写入都带 epoch，
+        # 中途若有人接管了锁（比如另一次恢复），本次结果一律不落库。
+        fence = sessions_repo.begin_write(db, session)
+
         all_answers = answers_repo.list_for_session(db, session.id)
         by_question = {a.question_id: a for a in all_answers}
 
@@ -270,12 +275,13 @@ def recover_session(
 
         pending = safe_wait_point(ordered, by_question)
         if pending is None:
+            sessions_repo.check_fence(session, fence)
             sessions_repo.touch(
                 db, session, status="FINISHED", current_question_id=None,
                 completion_reason="ALL_ANSWERED", finished=True,
                 progress={"stage": "FINISHED"},
             )
-            sessions_repo.bump_state_version(db, session)
+            sessions_repo.bump_state_version(db, session, fence=fence)
             db.commit()
             return {
                 "session_id": str(session.id),
@@ -312,7 +318,8 @@ def recover_session(
         completed_count = sum(
             1 for a in by_question.values() if a.processing_status == "COMPLETED"
         )
-        new_version = sessions_repo.bump_state_version(db, session)
+        sessions_repo.check_fence(session, fence)
+        new_version = sessions_repo.bump_state_version(db, session, fence=fence)
         sessions_repo.touch(
             db, session, status="IN_PROGRESS",
             current_question_id=pending.id,

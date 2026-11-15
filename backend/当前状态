@@ -270,3 +270,72 @@
 - 前端行为项只做了代码层与构建验证，浏览器端到端点检需要在服务启动后手动过一遍
   （尤其"刷新时待提交续跑"和"准备失败重试出题"两条）。
 - checkpoint 无 TTL 仍未处理；"我的面试"列表页仍缺；登录失败无次数限制。
+
+阶段 8（2026-11-15 17:30-18:10）：四项工程化优化（报告 / write_epoch / 后台补偿 / 分层降级）
+依据：《AI面试系统四项优化实现方案.docx》。迁移 b7f3c21d9e04（head，alembic check 无漂移）。
+
+【一 复盘报告】新增 GET /api/interviews/{id}/report
+- app/services/reporting.py：纯函数聚合（输入 ORM 行 → 输出可序列化对象），
+  app/schemas/report.py：响应契约。接口复用 _owned_session，跨账号一律 404。
+- 口径：只统计 COMPLETED 且有合法 score 的记录；跳过不计入平均分但计入 skipped_count；
+  失败/未完成分别计数；总体分是有效分算术平均（无有效分 → null，绝不写 0）；
+  覆盖率 = 有效分 / (总题数 - 跳过数)；五维只统计有数值的样本（题型不同不补 0）；
+  类别空值归"未分类"；missing_points 完全相同合并计数、按次数倒序取前 10；
+  证据取最高分与最低分（各 3 条，去重后 ≤6），回答摘要 ≤500 字。
+- 不调用模型（有测试 monkeypatch 适配器断言 0 次调用）、不返回 rubric_results、
+  不返回内部裁决 detail；重复打开结论一致且不改 state_version。
+- 前端：结束页新增 ReportView（总分/覆盖率/五维条/薄弱点/建议/类别/代表回答），
+  与 records 并行加载（allSettled，一个失败不拖累另一个）。
+
+【二 数据库级 write_epoch】
+- interview_sessions.write_epoch BIGINT（迁移）；interview_answers.write_epoch 记录"哪一代写下的"。
+- sessions_repo.WriteFence + begin_write：行锁内递增 epoch、读出 state_version，**立刻提交**
+  （绝不把行锁带进模型调用）；bump_state_version(fence=) 用
+  `WHERE id=? AND state_version=? AND write_epoch=?` 条件更新。
+- 接入路径：start_interview、submit_answer（锁内取得栅栏）、_finalize / _rebuild_from_state /
+  _persist_partial、finish_interview、recover_session、后台补偿 resume_claimed_answer。
+- 两个错误码分开：WRITE_FENCE_LOST（epoch 变了 → 失去写入资格，重新举手）/
+  VERSION_CONFLICT（epoch 还是我的，业务状态被推进过 → 重新读状态）。
+- 迟到写入不落库：条件更新 0 行 → _bump_or_rollback 先回滚（回答/追问题/进度一起撤），
+  再抛错。有测试覆盖"评分、进度、追问、结束会话"四类写入。
+
+【三 失败提交后台补偿】
+- interview_answers 新增 retryable / next_retry_at / attempt_count / claimed_at / claim_token
+  + 索引 (processing_status, retryable, next_retry_at)（时间列是 timestamptz）。
+- app/services/compensation.py：错误分类（可重试 / 需恢复 / 业务冲突 / 不可重试）+
+  退避表 30s→2min→10min→30min + 最多 4 次。未知错误码按不可重试处理（不让 bug 变成四次费用）。
+- answers_repo.fail 自动写 retryable/next_retry_at；due_for_retry 与 claim_for_retry 用同一套条件，
+  claim 是条件更新（rowcount=1 才是执行者），claimed_at 超 5 分钟允许被重新接管。
+- app/services/retry_worker.py + scripts/retry_worker.py：独立进程，--once/--interval/--batch。
+  执行前重读会话与回答、拿会话锁、再判"会话是否结束 / 是否已完成 / 题是否还对得上"；
+  用**原 request_id + 原回答内容**续跑（换 id 等于把一次提交变成两次）。
+- 抢不到锁：延后 30 秒放回队列（并还原 FAILED 状态，否则这行永远不会再被扫到）。
+- 已满 4 次 / 会话已结束 / 不可重试 → mark_retry_exhausted：退出队列 + 留痕，等人处理。
+
+【四 分层模型降级】
+- 解析：结构错误最多修复一次（已存在）；超时/不可用/输出非法错误码分层不变。
+- 评分失败：保留原回答、不生成分数、不推进下一题、写 FAILED + retryable + 拒绝 rubric。
+- 追问失败：跳过追问继续主流程，写 degradation_level=FOLLOWUP_SKIPPED；
+  对外 followup_decision 如实报 FOLLOWUP_FAILED（内部 rule_decision 保留规则链原判）。
+- 回答行新增 degradation_level / degradation_reason / model_name / prompt_version；
+  submit 响应新增 degradation 字段（正常为 null）。
+- **顺带修掉一个真 bug（重要）**：build_followup 失败时原来往 followup_decisions 里追加
+  一条记录，而这个列表是**按下标与 evaluations 对齐**的（"第几条回答取第几条裁决"）——
+  多塞一条会让后面所有题的裁决整体错位一格（第 3 题记录里写着第 2 题没追问的原因）。
+  现在失败留痕改走独立的 followup_failures + followup_build_failed 标志，条件边用它判定。
+
+验证
+- pytest tests：259 passed（204 → +55）。新增覆盖：报告统计 8 项与接口 5 项（含权限、
+  不调模型、无数据返回 null）、write_epoch 5 项（迟到写入/半截写入回滚/版本冲突区分）、
+  补偿 4 项分类 + 10 项 worker（入队/抢占/接管/执行/延后/上限/会话已结束）、
+  追问失败降级与评分失败不推进各 1 项、真库端到端报告 3 项。
+- alembic：head = b7f3c21d9e04，upgrade 已在本地 PG 执行，alembic check 无漂移。
+- 前端：tsc --noEmit 通过、vite build 通过（258 kB / gzip 80 kB）。
+
+边界（如实说明）
+- 后台补偿要单独起进程（scripts/retry_worker.py），API 不会自动起它；不起时失败提交只能手动重试。
+- 补偿是"至多一次有效结果"，不是 exactly-once：模型超时后若供应商其实已算完，重试多花一次钱，
+  但不会产生两份评分（唯一约束 + write_epoch + state_version 三道）。
+- 报告实时聚合不落库：结论稳定但没有历史快照/分享链接。
+- 准备工作阶段的写入（_set_stage / _fail_preparation）未接栅栏：它们发生在答题之前，
+  只有准备任务在写；接入需要在准备阶段也拿会话锁，代价大于收益，这里明确不做。

@@ -149,9 +149,13 @@ def test_followup_generation_failure_advances_without_reasking(monkeypatch):
     assert payload["follow_up_index"] == 0  # 是新主问题，不是旧题重问
 
     state = graph.get_state(cfg).values
-    last = state["followup_decisions"][-1]
-    assert last["decision"] == "stop"
-    assert last["reason_code"] == "FOLLOWUP_FAILED"
+    # 失败留痕走独立列表 followup_failures；裁决列表必须保持"每题恰好一条"，
+    # 否则按题序取裁决时后面所有题都会整体错位一格。
+    failure = state["followup_failures"][-1]
+    assert failure["reason_code"] == "FOLLOWUP_FAILED"
+    assert failure["main_index"] == 1
+    assert state["followup_build_failed"] is True
+    assert len(state["followup_decisions"]) == len(state["evaluations"]) == 1
 
 
 def test_checkpoint_continuation_and_accumulation():

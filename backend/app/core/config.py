@@ -167,6 +167,13 @@ class Settings:
     # LLM_MOCK=1 时全部模型调用走 mock 适配器（开发/测试/CI 用）
     llm_mock: bool = field(default_factory=lambda: _env("LLM_MOCK", "0") == "1")
     business: BusinessDefaults = field(default_factory=_business_defaults)
+    # 失败提交后台补偿（scripts/retry_worker.py 读它，API 进程不使用）
+    retry_worker_interval_seconds: int = field(
+        default_factory=lambda: int(_env("RETRY_WORKER_INTERVAL_SECONDS", "15") or 15)
+    )
+    retry_worker_batch: int = field(
+        default_factory=lambda: int(_env("RETRY_WORKER_BATCH", "5") or 5)
+    )
 
     @property
     def llm_ready(self) -> bool:
