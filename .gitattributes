@@ -1,0 +1,18 @@
+# 统一按文本处理。仓库内部已由 core.autocrlf 规范化为 LF 存储，
+# 这里不强制 eol，避免检出时产生一批纯行尾符的假 diff。
+* text=auto
+
+# Windows 脚本保留 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制文件禁止转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.docx binary
+*.xlsx binary
+*.zip binary
