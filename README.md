@@ -4,6 +4,8 @@
 
 不是"套壳聊天"：把面试建模成状态机，题量、轮次、追问次数由代码控制，模型只负责"说什么"，不负责"流程往哪走"。
 
+> 前端仓库：[ai-interview-platform-web](https://github.com/orange15175/ai-interview-platform-web)
+
 ## 流程
 
 ```
@@ -76,10 +78,11 @@ cp .env.example .env          # 填入 TEXT_API_KEY 与 VISION_API_KEY
 
 接口文档：http://127.0.0.1:8000/docs
 
-**3. 前端**（独立目录，非本仓库）
+**3. 前端**（独立仓库）
 
 ```bash
-cd ../ai面试-前端
+git clone git@github.com:orange15175/ai-interview-platform-web.git
+cd ai-interview-platform-web
 npm install && npm run dev    # http://localhost:5173
 ```
 
