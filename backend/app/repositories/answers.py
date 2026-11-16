@@ -13,7 +13,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as OrmSession
 
@@ -29,12 +29,14 @@ CLAIM_STALE_SECONDS = 300
 
 
 def _as_uuid(value: uuid.UUID | str) -> uuid.UUID:
+    """把字符串 ID 转成 UUID，供回答查询条件使用。"""
     return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
 
 
 def get_by_request(
     db: OrmSession, session_id: uuid.UUID | str, request_id: str
 ) -> InterviewAnswer | None:
+    """按会话和请求 ID 找旧提交，这是判断结果回放或续跑的依据。"""
     stmt = select(InterviewAnswer).where(
         InterviewAnswer.session_id == _as_uuid(session_id),
         InterviewAnswer.request_id == request_id,
@@ -45,6 +47,7 @@ def get_by_request(
 def get_by_question(
     db: OrmSession, session_id: uuid.UUID | str, question_id: uuid.UUID | str
 ) -> InterviewAnswer | None:
+    """查这道题是否已经登记回答，防止换请求 ID 再答同一题。"""
     stmt = select(InterviewAnswer).where(
         InterviewAnswer.session_id == _as_uuid(session_id),
         InterviewAnswer.question_id == _as_uuid(question_id),
@@ -53,16 +56,39 @@ def get_by_question(
 
 
 def get(db: OrmSession, answer_id: uuid.UUID | str) -> InterviewAnswer | None:
+    """按回答 ID 读取单条记录，不负责会话归属检查。"""
     return db.get(InterviewAnswer, _as_uuid(answer_id))
 
 
 def list_for_session(db: OrmSession, session_id: uuid.UUID | str) -> list[InterviewAnswer]:
+    """读取一场面试的全部回答，供正式记录、报告和恢复使用。"""
     stmt = (
         select(InterviewAnswer)
         .where(InterviewAnswer.session_id == _as_uuid(session_id))
         .order_by(InterviewAnswer.created_at)
     )
     return list(db.scalars(stmt))
+
+
+def average_scores(
+    db: OrmSession, session_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, float]:
+    """按会话批量算平均分（列表页用），一次查询解决，避免每行单独聚合。
+
+    只统计有分的回答：跳过题和评分失败的题 score 为 NULL，把它们算进分母
+    等于把"没答"当成"答了 0 分"。会话没有有效分数时不出现在返回的映射里。
+    """
+    if not session_ids:
+        return {}
+    stmt = (
+        select(InterviewAnswer.session_id, func.avg(InterviewAnswer.score))
+        .where(
+            InterviewAnswer.session_id.in_(session_ids),
+            InterviewAnswer.score.is_not(None),
+        )
+        .group_by(InterviewAnswer.session_id)
+    )
+    return {sid: float(avg) for sid, avg in db.execute(stmt).all()}
 
 
 def create(
@@ -76,11 +102,10 @@ def create(
     answer_content: str | None,
     expected_state_version: int | None = None,
 ) -> InterviewAnswer:
-    """登记一条新回答（PENDING）。
+    """登记带输入指纹的 PENDING 回答，先留下原始提交再执行模型。
 
     唯一约束冲突时抛 IntegrityError，由服务层判定是"重试"还是"重复提交"——
-    仓储层不猜业务语义。
-    """
+    仓储层不猜业务语义。"""
     row = InterviewAnswer(
         id=uuid.uuid4(),
         session_id=_as_uuid(session_id),
@@ -107,10 +132,9 @@ def create(
 def mark_stage(
     db: OrmSession, answer: InterviewAnswer, stage: str, *, bump_attempt: bool = True
 ) -> InterviewAnswer:
-    """记录"处理到哪一步"。
+    """更新回答处理到了哪一步，便于失败后判断还能复用什么结果。
 
-    恢复时按它判断哪些阶段已经成功、不必重调模型（§9.3 第 6 条）。
-    """
+    恢复时按它判断哪些阶段已经成功、不必重调模型。"""
     answer.processing_status = "PROCESSING" if stage not in ("COMPLETED", "FAILED") else stage
     answer.processing_stage = stage
     if bump_attempt:
@@ -122,7 +146,7 @@ def mark_stage(
 def save_evaluation(
     db: OrmSession, answer: InterviewAnswer, *, evaluation: dict | None, score: int | None
 ) -> InterviewAnswer:
-    """评分结果单独落库：追问生成失败时这份评分必须能复用，不能重打一遍模型。"""
+    """保存评分和总分，后续追问失败时仍可保留这份结果。"""
     answer.evaluation = evaluation
     answer.score = score
     answer.processing_stage = "EVALUATED"
@@ -131,7 +155,7 @@ def save_evaluation(
 
 
 def save_decision(db: OrmSession, answer: InterviewAnswer, *, decision: dict) -> InterviewAnswer:
-    """规则链裁决（含 reason_code / rule_version），复盘依据。"""
+    """保存是否追问、原因码和规则版本，便于复盘与恢复。"""
     answer.rule_decision = decision
     answer.processing_stage = "DECIDED"
     db.flush()
@@ -146,13 +170,12 @@ def complete(
     result_state_version: int | None = None,
     epoch: int | None = None,
 ) -> InterviewAnswer:
-    """标记完成并保存可回放响应。
+    """把回答标成完成，并保存响应快照、结果版本和完成时的写入代次。
 
-    幂等重试用它直接返回上次的结果（§9.3 第 2 条），不再跑模型。
+    幂等重试用它直接返回上次的结果，不再跑模型。
     完成即退出补偿队列：保持 retryable=True 会让后台 worker 反复扫到一条
     已经成功的行（条件里虽有 processing_status='FAILED' 兜底，但留着脏标记
-    迟早会在别的查询里咬人）。
-    """
+    迟早会在别的查询里咬人）。"""
     answer.processing_status = "COMPLETED"
     answer.processing_stage = "COMPLETED"
     answer.response_snapshot = response_snapshot
@@ -177,13 +200,12 @@ def fail(
     message: str,
     epoch: int | None = None,
 ) -> InterviewAnswer:
-    """处理失败：保留记录与阶段，供恢复入口对账（不删行）。
+    """记录提交失败原因，再按错误类别安排自动重试或停止重试。
 
-    同时决定"这条失败要不要进后台补偿队列"（§5.2）：
+    同时决定"这条失败要不要进后台补偿队列"：
     - 模型瞬时失败 → retryable=True + next_retry_at（30 秒后第一次接手）；
     - 需恢复/业务冲突/不可重试 → retryable=False，永不自动重试。
-    分类逻辑在 services/compensation.py，这里只负责把结论写到行上。
-    """
+    分类逻辑在 services/compensation.py，这里只负责把结论写到行上。"""
     answer.processing_status = "FAILED"
     answer.processing_stage = answer.processing_stage or "FAILED"
     answer.last_error_code = code
@@ -225,7 +247,7 @@ def record_evaluation_meta(
     model_name: str | None,
     prompt_version: str | None = "v1",
 ) -> InterviewAnswer:
-    """记下这次评分是哪套模型/提示词产的（复盘"模型质量"时的唯一线索）。"""
+    """记录评分模型和提示词版本，便于定位不同版本的评分差异。"""
     if model_name:
         answer.model_name = model_name[:64]
     if prompt_version:
@@ -237,11 +259,10 @@ def record_evaluation_meta(
 def record_degradation(
     db: OrmSession, answer: InterviewAnswer, *, level: str, reason: str
 ) -> InterviewAnswer:
-    """记录一次降级（不改变处理状态）。
+    """记录评分或追问降级信息，不直接改变回答完成状态。
 
     追问失败就是走这里：分已经算出来了，只是少问了一句——这不是失败，
-    不该把整条回答标成 FAILED，但必须留痕，否则"追问率低"永远查不出原因。
-    """
+    不该把整条回答标成 FAILED，但必须留痕，否则"追问率低"永远查不出原因。"""
     answer.degradation_level = level[:32]
     answer.degradation_reason = reason[:200]
     db.flush()
@@ -255,11 +276,10 @@ def record_graph_position(
     stage: str,
     wait_question_id: uuid.UUID | None,
 ) -> InterviewAnswer:
-    """记录"这一段处理时图在哪"。
+    """保存执行前图的等待位置，重试时据此判断是否已经消费过回答。
 
     重试时它是唯一能把"图已推进"和"图还在等这一题"分开的证据：
-    两次记录的等待题不同 → 图消费过这次回答，只能补写数据库，不能重跑。
-    """
+    两次记录的等待题不同 → 图消费过这次回答，只能补写数据库，不能重跑。"""
     answer.graph_stage = stage
     answer.graph_wait_question_id = (
         _as_uuid(wait_question_id) if wait_question_id is not None else None
@@ -269,12 +289,11 @@ def record_graph_position(
 
 
 def delete(db: OrmSession, answer: InterviewAnswer) -> None:
-    """物理删除一条**从未产生任何结果**的提交。
+    """删除恢复流程确认无结果的提交记录；调用方负责决定它是否可删。
 
     只允许恢复对账时对"空壳"记录使用（没有评分、没有裁决、没有快照）：
     这种行只是用户输入的残影，留着会让 (session_id, question_id) 唯一约束
-    把这道题永久锁死。任何带结果的记录都不许删（那是正式记录）。
-    """
+    把这道题永久锁死。任何带结果的记录都不许删（那是正式记录）。"""
     if answer.evaluation is not None or answer.rule_decision is not None:
         raise ValueError("拒绝删除带评分或裁决的回答记录")
     db.delete(answer)
@@ -285,6 +304,7 @@ def delete(db: OrmSession, answer: InterviewAnswer) -> None:
 
 
 def _claim_deadline(now: datetime, stale_seconds: int) -> datetime:
+    """计算抢占已超时的时间分界：早于这个时间的抢占可以重新领取。"""
     return now - timedelta(seconds=stale_seconds)
 
 
@@ -295,11 +315,10 @@ def due_for_retry(
     now: datetime | None = None,
     stale_seconds: int = CLAIM_STALE_SECONDS,
 ) -> list[InterviewAnswer]:
-    """扫出到期可自动重试的失败提交（只读，不等同于抢占）。
+    """只读扫描到期失败记录，扫描到不代表本 worker 已经取得处理权。
 
     条件全部写在这里，扫描与抢占必须用同一套口径，否则会出现
-    "扫出来却抢不到"的假任务，把 worker 的空转伪装成有活干。
-    """
+    "扫出来却抢不到"的假任务，把 worker 的空转伪装成有活干。"""
     now = now or datetime.now(timezone.utc)
     stmt = (
         select(InterviewAnswer)
@@ -330,12 +349,11 @@ def claim_for_retry(
     now: datetime | None = None,
     stale_seconds: int = CLAIM_STALE_SECONDS,
 ) -> bool:
-    """原子抢占一条失败提交：rowcount == 1 的那个 worker 才是执行者（§5.3）。
+    """通过数据库条件更新抢占任务，只有影响一行的 worker 才能继续处理。
 
     为什么不能"先查出来再改状态"：两个 worker 同时扫到同一行时，两边都会
     查到、都会去跑模型，结果是重复计费 + 两份结果抢着落库。条件更新把
-    "读—判断—改"压成一条 SQL，数据库替我们做互斥。
-    """
+    "读—判断—改"压成一条 SQL，数据库替我们做互斥。"""
     now = now or datetime.now(timezone.utc)
     result = db.execute(
         update(InterviewAnswer)
@@ -364,12 +382,11 @@ def claim_for_retry(
 
 
 def release_claim(db: OrmSession, answer: InterviewAnswer, *, reason: str) -> None:
-    """放弃本次抢占并把任务放回队列（会话已结束、题不匹配等）。
+    """清除本次任务抢占，让后续扫描可以再次领取。
 
     刻意不删记录：这类"不该由后台处理"的情况要留下失败事实，
     只是把抢占放掉。processing_status 显式写回 FAILED——抢占时它是 PROCESSING，
-    不写回来这条记录就永远卡在"处理中"，恢复对账时会被当成半途任务。
-    """
+    不写回来这条记录就永远卡在"处理中"，恢复对账时会被当成半途任务。"""
     log.info("释放补偿抢占 answer=%s: %s", answer.id, reason)
     answer.processing_status = "FAILED"
     answer.claimed_at = None
@@ -381,7 +398,7 @@ def release_claim(db: OrmSession, answer: InterviewAnswer, *, reason: str) -> No
 
 
 def mark_retry_exhausted(db: OrmSession, answer: InterviewAnswer, *, reason: str) -> None:
-    """到达最大次数/不可重试：退出队列，等人处理。"""
+    """停止该回答的自动重试，保留失败记录等待人工或用户处理。"""
     answer.processing_status = "FAILED"
     answer.retryable = False
     answer.next_retry_at = None

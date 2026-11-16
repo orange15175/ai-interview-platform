@@ -25,7 +25,7 @@ _client: Redis | None = None
 
 
 def get_redis() -> Redis:
-    """惰性单例客户端。decode_responses=True：直接拿 str，省一层手工解码。"""
+    """首次使用时创建 Redis 客户端，后续复用连接池并直接读写字符串。"""
     global _client
     if _client is None:
         url = get_settings().redis_url
@@ -35,13 +35,13 @@ def get_redis() -> Redis:
 
 
 def reset_redis() -> None:
-    """测试用：强制下次重新创建客户端。"""
+    """清掉缓存客户端引用，下次使用时按新配置创建客户端；这里不主动关闭旧连接。"""
     global _client
     _client = None
 
 
 def ping_redis() -> bool:
-    """探活，给健康检查用。Redis 不可用不抛异常，只返回 False。"""
+    """发送一次 Redis ping 供健康检查使用，连接失败按 False 处理。"""
     try:
         return bool(get_redis().ping())
     except RedisError as exc:
@@ -50,17 +50,16 @@ def ping_redis() -> bool:
 
 
 def _sanitize_redis_url(url: str) -> str:
-    """日志里不输出密码（如果有）。"""
+    """在日志输出连接地址前隐藏密码，避免凭证泄露。"""
     if "@" in url:
         return url.split("@", 1)[-1]
     return url
 
 
 def app_key(*parts: str) -> str:
-    """统一 key 生成：aiiv:{env}:{part1}:{part2}...（§9.1）。
+    """在 Redis 键前加项目与环境标记，减少不同环境之间的键冲突。
 
     环境标识不是装饰：同一个 Redis 实例上跑 dev 与 prod 时，没有它就会
-    互相清锁、互相读到别人的幂等缓存。
-    """
+    互相清锁、互相读到别人的幂等缓存。"""
     env = get_settings().env_name or "dev"
     return f"{KEY_PREFIX}:{env}:" + ":".join(str(p) for p in parts)

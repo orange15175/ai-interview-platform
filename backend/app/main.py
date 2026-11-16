@@ -34,14 +34,17 @@ class PendingCookieMiddleware:
     """
 
     def __init__(self, app):
+        """保存下一层 ASGI 应用，后续请求仍交给它处理。"""
         self.app = app
 
     async def __call__(self, scope, receive, send):
+        """拦截 HTTP 响应出口，把依赖中登记的访客 Cookie 加到响应头。"""
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
 
         async def send_wrapper(message):
+            """只在响应头发送时补 Cookie；响应正文和其他消息原样转发。"""
             if message["type"] == "http.response.start":
                 # 到这一步依赖已执行完，request.state 里的登记才可见
                 state = scope.get("state")
@@ -56,15 +59,14 @@ class PendingCookieMiddleware:
 
 
 def _app_error_handler(request: Request, exc: AppError) -> JSONResponse:
-    """领域错误 → JSON {code, message, retryable}，前端按 code 分支。
+    """把业务异常转成统一 JSON，让前端根据错误码决定提示或重试。
 
-    http_status 由错误类自带（§10：状态码在 OpenAPI 里统一可查）。
-    """
+    http_status 由错误类自带。"""
     return JSONResponse(status_code=exc.http_status, content=exc.to_dict())
 
 
 def _validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
-    """请求体校验失败 → 422 + 第一条人话（不把 pydantic 的原始 loc 甩给用户）。"""
+    """把参数校验错误转成一条可读提示，返回 422。"""
     first = exc.errors()[0] if exc.errors() else {}
     loc = ".".join(str(x) for x in first.get("loc", ()) if x != "body")
     msg = first.get("msg", "请求参数不合法")
@@ -79,12 +81,11 @@ def _validation_error_handler(request: Request, exc: RequestValidationError) -> 
 
 
 def _unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:
-    """兜底 500：不接的话 FastAPI 返回纯文本，前端 res.json() 解析失败。
+    """兜住未预期异常：细节写日志，前端只收到通用 500 错误。
 
     对外只给稳定 code + 人话，堆栈只进日志（绝不回传给客户端）。
     retryable=True：这类错误多数是瞬时故障，允许前端用同一个 request_id 重试
-    （幂等由后端保证，不会重复计分）。
-    """
+    （幂等由后端保证，不会重复计分）。"""
     log.exception("未捕获异常 %s %s", request.method, request.url.path)
     return JSONResponse(
         status_code=500,
@@ -97,6 +98,7 @@ def _unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:
 
 
 def create_app() -> FastAPI:
+    """创建 FastAPI 应用，接上路由、Cookie/CORS 中间件和统一异常处理器。"""
     app = FastAPI(
         title="AI 模拟面试系统",
         version="1.0.0",

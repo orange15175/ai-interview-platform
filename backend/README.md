@@ -3,6 +3,8 @@
 匿名访客上传简历（+可选 JD），双模型生成面试题并逐题作答评分，全程可恢复、可审计。
 按《AI面试系统开发说明》五阶段改造实现；架构：FastAPI + LangGraph(interrupt/resume) + PostgreSQL(正式记录) + Redis(checkpoint/锁/幂等缓存)。
 
+第一次读项目请先看 [从上传到结束的代码阅读路线](代码阅读路线.md)：按真实前端按钮追到接口、模型、数据库和结束页，附各步保护措施、失败去向及当前缺口。`app/` 下每个函数和方法也有通俗说明，可按文中的方法名定位。
+
 ## 启动
 
 ```bash
@@ -71,7 +73,7 @@ python -m venv ../.venv && ../.venv/Scripts/pip install -r requirements.txt
 ## 测试与验收
 
 ```bash
-cd backend && ../.venv/Scripts/python -m pytest tests -q     # 259 passed（LLM_MOCK=1，零模型费用）
+cd backend && ../.venv/Scripts/python -m pytest tests -q     # 286 passed（LLM_MOCK=1，零模型费用）
 ../.venv/Scripts/python scripts/verify_phase4_real.py         # 并发/幂等/恢复 真机验收（真 PG+Redis）
 ../.venv/Scripts/python scripts/verify_phase5_real.py         # HTTP 全流程 + 匿名隔离 真机验收
 ```
@@ -118,8 +120,9 @@ cd backend && ../.venv/Scripts/python -m pytest tests -q     # 259 passed（LLM_
 - **没有频率限制**：匿名接口可被反复调用（每次创建会真实消耗模型额度）。公网部署前
   必须加网关层限流（按 IP/Cookie），否则存在刷额度的风险。
 - 提交后修改答案未开放（首期一题一次，口径见开发说明 §7）。
-- 复盘报告是**实时聚合**，不落库：同一份记录每次打开结论一致（不调模型），但历史版本不留存；
-  需要"报告快照/分享链接"要另建表。
+- 复盘报告在会话终结后落快照（`interview_sessions.report_snapshot`）：首次打开时若所有题已有终态，
+  聚合一次写入、之后直接读缓存；仍有 PENDING/FAILED 题时不写，照常现场算，避免缓存了会变的分数。
+  快照依赖"每题只允许提交一次"的契约；若将来开放改答案，需给快照加版本号并失效重算。
 - 后台补偿进程要单独起（`scripts/retry_worker.py`）：不起时失败提交只能靠用户手动重试；
   它停了不会影响答题接口，补跑也从数据库状态出发（不会漏也不会重）。
 - 长文本 PDF 仅取前 10 页（`MAX_PDF_PAGES`），单文件 ≤10MB（上传分块读取，超限当场中断，

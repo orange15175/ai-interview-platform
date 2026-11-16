@@ -1,4 +1,4 @@
-"""五张业务表 + 恢复进度（开发说明 §8）。
+"""正式业务表：用户、访客、会话、材料、题目和回答。
 
 关键决策对照文档：
 - 服务端生成 UUID 主键（不信任客户端传入的 ID）。
@@ -119,6 +119,11 @@ class InterviewSession(Base):
 
     # 恢复进度：受控 JSONB（§8 末段），阶段 4 的 recovery 专用重建依据
     progress: Mapped[dict] = mapped_column(JSONVar, default=dict)
+
+    # 复盘报告快照：全部题目都有终态结果后，首次生成时固化这一份。
+    # 为空 = 还没结束或还有题没跑完，读接口现场聚合（services/reporting.py）。
+    # 只在"再也不会变"的时候写，所以不需要版本号/失效逻辑。
+    report_snapshot: Mapped[dict | None] = mapped_column(JSONVar, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
     started_at: Mapped[datetime | None] = mapped_column(nullable=True)

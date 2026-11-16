@@ -1,4 +1,8 @@
-"""Redis checkpoint 丢失后，从 PostgreSQL 显式重建到等待点（开发说明 §9.4）。
+"""从 PostgreSQL 正式记录重建面试图。
+
+Redis checkpoint 只代表“图停在哪里”，PostgreSQL 才是题目和正式回答的事实来源。
+recover_session 会先加锁，对未完成提交做对账，再生成 restore 图，并核对当前题、
+评分数量和追问序号；任何一项对不上都要求再次恢复，不凭空猜结果。
 
 边界先讲清楚，避免过度承诺：
 - 能恢复：材料、题目、已完成回答及其评分/裁决（都已落库），以及"当前该问哪一题"。
@@ -42,11 +46,10 @@ log = get_logger(__name__)
 def safe_wait_point(
     questions: list[InterviewQuestion], answers: dict[uuid.UUID, InterviewAnswer]
 ) -> InterviewQuestion | None:
-    """第一道没有"已完成回答"的题；全部答完返回 None。
+    """按题序找到第一道没有完成回答的题，全部完成时返回 None。
 
     questions 必须已按 (main_index, follow_up_index) 升序——顺序就是他答题的顺序。
-    这里不推断"本该有但没落库的追问"：宁可少问一次追问，也不重复计分。
-    """
+    这里不推断"本该有但没落库的追问"：宁可少问一次追问，也不重复计分。"""
     for q in questions:
         row = answers.get(q.id)
         if row is None or row.processing_status != "COMPLETED":
@@ -61,10 +64,11 @@ def _seed_state(
     answers: dict[uuid.UUID, InterviewAnswer],
     pending: InterviewQuestion,
 ) -> dict[str, Any]:
-    """把数据库记录翻译成图能直接消费的初始 state（restore 变体用）。"""
+    """把数据库题目、历史评分和待答位置转换成恢复图需要的初始状态。"""
     evaluations: list[dict | None] = []
     decisions: list[dict] = []
     asked: list[str] = []
+    history: list[dict] = []
 
     for q in questions:
         # 已问过 = 顺序上不晚于待答点的题（含待答点本身，它即将被问）
@@ -73,6 +77,10 @@ def _seed_state(
         row = answers.get(q.id)
         if row is None or row.processing_status != "COMPLETED":
             continue
+        if (q.main_index == pending.main_index
+                and q.follow_up_index < pending.follow_up_index
+                and row.submission_kind != "skip"):
+            history.append({"question": q.content, "answer": row.answer_content or ""})
         evaluations.append(row.evaluation)  # skipped 的题存 None，保持顺序对齐
         if row.rule_decision:
             decisions.append(row.rule_decision)
@@ -106,6 +114,7 @@ def _seed_state(
         "evaluations": evaluations,
         "followup_decisions": decisions,
         "asked_contents": asked,
+        "answer_history": history,
         "finished": False,
     }
 
@@ -113,11 +122,10 @@ def _seed_state(
 def _reconcile_unfinished(
     db: OrmSession, answers: list[InterviewAnswer]
 ) -> list[dict]:
-    """对账：把卡在 PENDING/PROCESSING 的提交标成 FAILED（留痕，不删除）。
+    """把中断的 PENDING/PROCESSING 提交记成失败，供后续决定续跑或清理。
 
     只处理"确实没有可复用结果"的行。带评分的行走 _complete_evaluated，
-    否则会把已经花过钱、也已经算出来的评分当成未作答重来一遍。
-    """
+    否则会把已经花过钱、也已经算出来的评分当成未作答重来一遍。"""
     reconciled: list[dict] = []
     for row in answers:
         if row.processing_status in ("PENDING", "PROCESSING"):
@@ -131,7 +139,7 @@ def _reconcile_unfinished(
 
 def _decision_record(question: InterviewQuestion, evaluation: dict | None,
                      skipped: bool, asked_targets: list[str]) -> dict:
-    """用规则链重算裁决。纯函数、无模型调用，所以恢复时可以安全地补。"""
+    """根据已有评分重新计算追问规则结果，不调用模型重新评分。"""
     from app.schemas.evaluation import Evaluation
     from app.rules.followup_rules import decide_followup
 
@@ -161,11 +169,10 @@ def _complete_evaluated(
     row: InterviewAnswer,
     next_view: dict | None,
 ) -> bool:
-    """评分已落库但回答没走完：补齐裁决与响应快照，**不重新评分**。
+    """已有评分但未完成的回答，只补追问决定和响应快照，避免丢掉已算出的分数。
 
     这正是"checkpoint 丢失 + 已有评分"的收口：把它当成未作答题会导致
-    1) 该题被唯一约束永久锁死（评分行删不掉）；2) 已经算出的分数被丢弃。
-    """
+    1) 该题被唯一约束永久锁死（评分行删不掉）；2) 已经算出的分数被丢弃。"""
     from app.services.interview_workflow import public_decision, public_evaluation
 
     question = next((q for q in ordered if q.id == row.question_id), None)
@@ -209,7 +216,7 @@ def _complete_evaluated(
 
 
 def _drop_empty_attempt(db: OrmSession, row: InterviewAnswer | None) -> bool:
-    """清掉待答题上的空壳提交（无评分、无裁决），否则这题永远提交不了。"""
+    """删除当前待答题上没有评分也没有裁决的空壳提交，让这道题可以重新提交。"""
     if row is None or row.processing_status == "COMPLETED":
         return False
     if row.evaluation is not None or row.rule_decision is not None:
@@ -224,11 +231,13 @@ def recover_session(
     restore_graph: CompiledStateGraph,
     session: InterviewSession,
 ) -> dict:
-    """执行一次显式恢复。调用方必须先做归属校验（get_owned）。"""
+    """拿锁后对账数据库回答，清理旧检查点并重建图，最后核对并保存新的等待位置。"""
     lock = locks.acquire(str(session.id))
     lock.start_auto_renew()
     try:
         db.refresh(session)
+        # 这里只检查已写入的状态，没有按 last_activity_at 再算超时。
+        # 如果过期状态未持久化，后续 touch 会刷新活动时间，这是现有生命周期缺口。
         if session.status in ("CANCELLED", "EXPIRED", "PREPARATION_FAILED"):
             raise SessionFinishedError("会话已结束，不能恢复")
         if session.status == "FINISHED":
@@ -363,7 +372,7 @@ def _verify_rebuilt(
     by_question: dict[uuid.UUID, InterviewAnswer],
     saver,
 ) -> None:
-    """重建后必须核对"图真的停在数据库认为的那一题"。
+    """核对恢复图的当前题、评分数量和追问号；对不上就清理图并报恢复失败。
 
     只 invoke 一次就宣布恢复成功是不够的：种子状态写错一个下标，图会安静地
     停到别的题上，用户随后答的每一道题都会被记到错误的题号下。所以这里逐条验：
@@ -371,8 +380,7 @@ def _verify_rebuilt(
     - 中断坐标 == 数据库当前题；
     - 图里的评分条数 == 数据库已完成条数（少了说明历史没重建，多了说明重算了）；
     - follow-up 次数没有被清零（清零会让追问次数超上限）。
-    任何一条不满足 → 删掉这个不可信的 thread，要求重试恢复。
-    """
+    任何一条不满足 → 删掉这个不可信的 thread，要求重试恢复。"""
     snap = graph_runtime.snapshot(graph, session.id)
     expected_completed = sum(
         1 for a in by_question.values() if a.processing_status == "COMPLETED"

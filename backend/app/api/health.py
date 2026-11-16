@@ -24,6 +24,7 @@ router = APIRouter(tags=["health"])
 
 
 def _db_ok() -> bool:
+    """执行一次 SELECT 1，判断数据库是否能连接；异常只转换成 False。"""
     try:
         with get_engine().connect() as conn:
             conn.execute(text("SELECT 1"))
@@ -33,6 +34,7 @@ def _db_ok() -> bool:
 
 
 def _redis_ok() -> bool:
+    """尝试 ping Redis，失败时返回 False，不把异常细节暴露出去。"""
     try:
         return bool(ping_redis())
     except Exception:  # noqa: BLE001
@@ -40,6 +42,7 @@ def _redis_ok() -> bool:
 
 
 def _snapshot() -> dict:
+    """汇总数据库、Redis 连通性及模型配置，不调用模型验证真实可用性。"""
     db_ok = _db_ok()
     redis_ok = _redis_ok()
     unavailable = [name for name, ok in (("db", db_ok), ("redis", redis_ok)) if not ok]
@@ -55,11 +58,12 @@ def _snapshot() -> dict:
 
 @router.get("/health", summary="健康检查（脱敏，组件不可用时 503）")
 def health() -> JSONResponse:
+    """依赖正常时返回 200，数据库或 Redis 不可用时返回 503。"""
     body = _snapshot()
     return JSONResponse(status_code=200 if body["status"] == "ok" else 503, content=body)
 
 
 @router.get("/health/live", summary="存活探针：进程活着就 200，不查依赖")
 def health_live() -> dict:
-    """liveness：只回答"进程还在吗"，不因数据库抖动而重启容器。"""
+    """只确认 API 进程还活着，不因为数据库抖动而判定进程死亡。"""
     return {"status": "alive"}

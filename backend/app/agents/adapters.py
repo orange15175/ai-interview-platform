@@ -28,14 +28,18 @@ class TextModelAdapter(Protocol):
     """文字模型接口：出题、评分、追问共用。"""
 
     def complete(self, system: str, user: str, *, temperature: float,
-                 max_tokens: int | None = None, json_mode: bool = False) -> str: ...
+                 max_tokens: int | None = None, json_mode: bool = False) -> str:
+        """约定文字模型的调用方式：接收提示词和生成参数，返回原始文本。"""
+        ...
 
 
 class VisionModelAdapter(Protocol):
     """解析模型接口：输入文字 + 图片字节，输出文本（通常是 JSON）。"""
 
     def complete(self, system: str, user: str, *, images: list[bytes],
-                 temperature: float = 0.1, json_mode: bool = False) -> str: ...
+                 temperature: float = 0.1, json_mode: bool = False) -> str:
+        """约定视觉模型的调用方式：接收文字和图片字节，返回原始文本。"""
+        ...
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +49,7 @@ class VisionModelAdapter(Protocol):
 
 class DeepSeekAdapter:
     def __init__(self, cfg: TextModelConfig):
+        """确认文字模型密钥已配置，创建带超时和网络重试设置的客户端。"""
         if not cfg.api_key:
             raise RuntimeError("TEXT_API_KEY 未配置：拒绝用空 key 冒充已联调（改用 LLM_MOCK=1）")
         self._model = cfg.model
@@ -52,6 +57,7 @@ class DeepSeekAdapter:
 
     def complete(self, system: str, user: str, *, temperature: float,
                  max_tokens: int | None = None, json_mode: bool = False) -> str:
+        """把系统提示词和用户材料发给文字模型，返回回复文本，结构校验由上层负责。"""
         kwargs: dict = {}
         if json_mode:
             # DeepSeek 原生支持 json_object 输出模式
@@ -82,7 +88,7 @@ _MIME_BY_MAGIC = [
 
 
 def _guess_mime(data: bytes) -> str:
-    """按文件魔数猜图片 MIME（§4.1：不信任客户端 Content-Type）。"""
+    """通过图片开头的字节判断 MIME 类型，不依赖上传者声明的 Content-Type。"""
     if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "image/webp"
     for magic, mime in _MIME_BY_MAGIC:
@@ -93,6 +99,7 @@ def _guess_mime(data: bytes) -> str:
 
 class QwenVisionAdapter:
     def __init__(self, cfg: VisionModelConfig):
+        """确认视觉模型密钥已配置，并创建独立客户端，避免混用文字模型配置。"""
         if not cfg.api_key:
             raise RuntimeError("VISION_API_KEY 未配置：拒绝用空 key 冒充已联调（改用 LLM_MOCK=1）")
         self._model = cfg.model
@@ -101,6 +108,7 @@ class QwenVisionAdapter:
     def complete(self, system: str, user: str, *, images: list[bytes],
                  temperature: float = 0.1, json_mode: bool = False) -> str:
         # 按官方样例：modalities=["text"] + 流式，逐块拼接
+        """把图片编码后和文字一起发送，逐块收集流式回复，最后拼成字符串。"""
         content: list[dict] = [{"type": "text", "text": user}]
         for img in images:
             b64 = base64.b64encode(img).decode("ascii")
@@ -144,6 +152,7 @@ class MockTextAdapter:
 
     def complete(self, system: str, user: str, *, temperature: float,
                  max_tokens: int | None = None, json_mode: bool = False) -> str:
+        """根据测试场景返回固定题目、评分或追问，不联网、不产生模型费用。"""
         if "@mock:questions" in system:
             # 从提示词里的「题目数量：N」解析出题数，让 15 题校验也能被测到
             import re
@@ -151,7 +160,16 @@ class MockTextAdapter:
             n = int(m.group(1)) if m else 1
             return _mock_questions_json(n)
         if "@mock:evaluation" in system:
-            return _MOCK_EVALUATION_JSON
+            if "{" not in user:
+                return _MOCK_EVALUATION_JSON
+            # 模拟输出也必须逐条评价输入要点，不能靠缺条绕过校验。
+            payload, _ = json.JSONDecoder().raw_decode(user[user.index("{"):])
+            result = json.loads(_MOCK_EVALUATION_JSON)
+            result["rubric_results"] = [
+                {"point": p["point"], "met": "partial", "note": "模拟回答部分覆盖此要点"}
+                for p in payload["question"]["evaluation_rubric"]
+            ]
+            return json.dumps(result, ensure_ascii=False)
         if "@mock:followup" in system:
             # 从提示词里的「当前问题」派生追问，保证不同主问题的追问互不重复。
             # 引用片段要去掉问号：FollowUpQuestion 强制单问号，引用原题干会误伤
@@ -159,14 +177,15 @@ class MockTextAdapter:
             m = re.search(r'"当前问题"\s*:\s*"([^"]*)"', user)
             q = (m.group(1) if m else "该系统")[:26].rstrip("？！?!.。；;，, ")
             return json.dumps(
-                {"content": f"你刚才提到「{q}」，当时是怎么测量 QPS 和 P99 延迟的？"},
+                {"content": f"你刚才提到「{q}」，当时是怎么测量 P99 延迟的？",
+                 "evaluation_rubric": [{"point": "说明P99延迟的测量方法", "weight": 1.0}]},
                 ensure_ascii=False,
             )
         return "mock-ok"
 
 
 def _mock_questions_json(n: int) -> str:
-    """生成 n 道结构合法、编号连续、内容互不重复的 mock 题目。"""
+    """生成指定数量的模拟题，保证编号连续、结构合法且题干不重复。"""
     import json
     questions = [
         {
@@ -188,6 +207,7 @@ def _mock_questions_json(n: int) -> str:
 class MockVisionAdapter:
     def complete(self, system: str, user: str, *, images: list[bytes],
                  temperature: float = 0.1, json_mode: bool = False) -> str:
+        """返回预设的结构化简历，供测试走完整流程，不执行真实识别。"""
         return _MOCK_MATERIALS_JSON
 
 
@@ -239,7 +259,7 @@ _MOCK_EVALUATION_JSON = """
 
 
 def get_text_adapter():
-    """出题/评分/追问用。LLM_MOCK=1 时全局 mock。"""
+    """根据 LLM_MOCK 选择模拟文字模型或真实 DeepSeek 客户端。"""
     s = get_settings()
     if s.llm_mock:
         return MockTextAdapter()
@@ -247,7 +267,7 @@ def get_text_adapter():
 
 
 def get_vision_adapter():
-    """解析用。LLM_MOCK=1 时全局 mock。"""
+    """根据 LLM_MOCK 选择模拟解析模型或真实视觉客户端。"""
     s = get_settings()
     if s.llm_mock:
         return MockVisionAdapter()

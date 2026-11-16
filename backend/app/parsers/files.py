@@ -25,6 +25,7 @@ class FileValidationError(AppError):
     http_status = 422
 
     def __init__(self, code: str, message: str):
+        """把文件错误码和可读提示包装成 422 业务错误。"""
         super().__init__(message, code=code)
 
 
@@ -48,13 +49,14 @@ DOC_EXT = {".doc"}
 
 
 def _ext(filename: str) -> str:
+    """取文件名最后一个扩展名并转小写，供格式分流使用。"""
     name = filename.lower()
     idx = name.rfind(".")
     return name[idx:] if idx >= 0 else ""
 
 
 def validate_upload(filename: str, data: bytes, limits: BusinessDefaults) -> UploadInfo:
-    """校验并返回文件画像。任何不合规都抛 FileValidationError（带稳定错误码）。"""
+    """依次检查大小、扩展名和文件头，再做格式对应的基本检查，返回文件信息。"""
     ext = _ext(filename or "")
     if not filename:
         raise FileValidationError("INVALID_FILE", "未提供文件名")
@@ -99,6 +101,7 @@ def validate_upload(filename: str, data: bytes, limits: BusinessDefaults) -> Upl
 
 
 def _looks_like_image(data: bytes) -> bool:
+    """识别常见图片文件头，初步拦截伪装成图片的文件。"""
     head = data[:12]
     return (
         head.startswith(b"\xff\xd8\xff")          # jpeg
@@ -112,6 +115,7 @@ def _looks_like_image(data: bytes) -> bool:
 
 
 def _validate_pdf(filename: str, data: bytes, limits: BusinessDefaults) -> UploadInfo:
+    """尝试打开 PDF，拒绝损坏、加密、空白页数或超页数文件。"""
     import pymupdf  # PyMuPDF（1.26+ 新包名，fitz 已弃用）
 
     try:
@@ -136,6 +140,7 @@ def _validate_pdf(filename: str, data: bytes, limits: BusinessDefaults) -> Uploa
 
 
 def _validate_docx(filename: str, data: bytes) -> UploadInfo:
+    """检查 ZIP 能否打开且包含 Word 正文；当前没有检查全部解压条目的大小。"""
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             if "word/document.xml" not in set(zf.namelist()):
@@ -146,6 +151,7 @@ def _validate_docx(filename: str, data: bytes) -> UploadInfo:
 
 
 def _validate_image(filename: str, data: bytes, limits: BusinessDefaults) -> UploadInfo:
+    """验证图片完整性和像素尺寸，拒绝损坏、过大或太小看不清的图片。"""
     try:
         with Image.open(io.BytesIO(data)) as img:
             img.verify()  # 只校验完整性，verify 后对象不可再用

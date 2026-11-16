@@ -36,7 +36,9 @@ class ParsedInput:
 
     @property
     def has_content(self) -> bool:
+        """判断是否至少存在非空文字或图片，避免空文件继续调用模型。"""
         return bool(self.text_blocks or self.render_blocks)
 
     def char_count(self) -> int:
+        """统计全部文字块字符数，用于输入上限和准备进度展示。"""
         return sum(len(b.text) for b in self.text_blocks)

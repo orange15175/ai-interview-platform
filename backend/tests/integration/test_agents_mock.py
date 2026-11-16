@@ -94,3 +94,29 @@ def test_generate_questions_rejects_unknown_evidence():
     materials = parse_materials(_input(), adapter=MockVisionAdapter())
     with pytest.raises(ModelOutputInvalidError, match="依据"):
         generate_questions(materials, count=1, adapter=GhostEvidenceAdapter())
+
+
+@pytest.mark.parametrize("category,evidence,valid", [
+    ("专业能力", ["jd-kafka"], True),
+    ("动机匹配", ["jd-kafka"], False),
+    ("专业能力", [], False),
+])
+def test_jd_only_skills_allowed_but_non_technical_or_ungrounded_questions_rejected(category, evidence, valid):
+    materials = ParsedMaterials.model_validate({
+        "resume": {"projects": [{"name": "Python项目"}], "skills": ["Python"]},
+        "jd": {"required_skills": ["Kafka"]},
+        "evidence": [{"id": "jd-kafka", "source": "jd", "quote": "要求掌握Kafka"}],
+    })
+    class Adapter:
+        def complete(self, system, user, **kwargs):
+            return json.dumps({"questions": [{
+                "main_index": 1, "category": category, "difficulty": "easy",
+                "content": "请说明Kafka消费者组的作用？", "material_evidence_ids": evidence,
+                "evaluation_rubric": [{"point": "解释消费者组分工消费分区的机制", "weight": 1.0}],
+            }]}, ensure_ascii=False)
+    if valid:
+        qs = generate_questions(materials, 1, adapter=Adapter())
+        assert qs.questions[0].material_evidence_ids == ["jd-kafka"]
+    else:
+        with pytest.raises(ModelOutputInvalidError):
+            generate_questions(materials, 1, adapter=Adapter())

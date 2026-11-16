@@ -20,11 +20,12 @@ from app.schemas.questions import GeneratedQuestion
 
 
 def _as_uuid(value: uuid.UUID | str) -> uuid.UUID:
+    """把题目或会话字符串 ID 转成 UUID，供数据库查询使用。"""
     return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
 
 
 def list_for_session(db: OrmSession, session_id: uuid.UUID | str) -> list[InterviewQuestion]:
-    """按 (主问题序号, 追问序号) 升序——恢复时的推进顺序就是它。"""
+    """按主问题号和追问号读取题目，恢复和展示沿用同一顺序。"""
     stmt = (
         select(InterviewQuestion)
         .where(InterviewQuestion.session_id == _as_uuid(session_id))
@@ -34,6 +35,7 @@ def list_for_session(db: OrmSession, session_id: uuid.UUID | str) -> list[Interv
 
 
 def get(db: OrmSession, question_id: uuid.UUID | str) -> InterviewQuestion | None:
+    """按题目 ID 查记录；题目是否属于当前会话需要调用方再检查。"""
     return db.get(InterviewQuestion, _as_uuid(question_id))
 
 
@@ -43,6 +45,7 @@ def get_by_index(
     main_index: int,
     follow_up_index: int = 0,
 ) -> InterviewQuestion | None:
+    """用会话、主问题号和追问号找到对应题目，把图位置关联到数据库。"""
     stmt = select(InterviewQuestion).where(
         InterviewQuestion.session_id == _as_uuid(session_id),
         InterviewQuestion.main_index == main_index,
@@ -54,11 +57,10 @@ def get_by_index(
 def insert_main_questions(
     db: OrmSession, session_id: uuid.UUID | str, questions: list[GeneratedQuestion]
 ) -> list[InterviewQuestion]:
-    """批量落主问题，幂等：已存在的 (main_index, 0) 跳过并复用。
+    """保存尚不存在的主问题编号；已有编号会复用旧题，不会覆盖内容。
 
     幂等的意义：解析/出题重试、或创建接口被重复调用时，不会因为多插一批题
-    把同一场面试变成 30 道题。
-    """
+    把同一场面试变成 30 道题。"""
     sid = _as_uuid(session_id)
     existing = {q.main_index: q for q in list_for_session(db, sid) if q.follow_up_index == 0}
 
@@ -94,10 +96,9 @@ def add_followup(
     rubric: list[dict] | None = None,
     evidence_ids: list[str] | None = None,
 ) -> InterviewQuestion:
-    """落一条追问；同一 (main_index, follow_up_index) 已存在则直接复用。
+    """保存新追问；编号已存在就复用，唯一约束冲突用保存点回滚本条插入。
 
-    并发/重试时靠唯一约束兜底：IntegrityError 说明另一路径已写入，回读即可。
-    """
+    并发/重试时靠唯一约束兜底：IntegrityError 说明另一路径已写入，回读即可。"""
     sid = _as_uuid(session_id)
     row = get_by_index(db, sid, parent.main_index, follow_up_index)
     if row is not None:
@@ -131,7 +132,7 @@ def add_followup(
 
 
 def public_dict(q: InterviewQuestion) -> dict:
-    """对外投影：**剔除 evaluation_rubric**（泄露标准等于泄题，§5/§10）。"""
+    """组装前端题目字段，过滤内部评分要点和材料引用。"""
     return {
         "question_id": str(q.id),
         "kind": q.kind,

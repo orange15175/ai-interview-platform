@@ -61,7 +61,7 @@ DEGRADATION_FOLLOWUP_SKIPPED = "FOLLOWUP_SKIPPED"     # 追问彻底失败，放
 
 
 def classify(code: str | None) -> FailureKind:
-    """错误码 → 处理方式。未知码按 fatal（不进队列）处理。"""
+    """把错误码分成可重试、需要恢复、冲突和致命四类，未知错误不自动重试。"""
     if not code:
         return "fatal"
     if code in RETRYABLE_CODES:
@@ -74,33 +74,31 @@ def classify(code: str | None) -> FailureKind:
 
 
 def is_retryable(code: str | None) -> bool:
-    """只有"模型瞬时失败"允许进后台队列。"""
+    """判断错误是否属于适合自动重试的模型瞬时故障。"""
     return classify(code) == "retryable"
 
 
 def backoff_seconds(attempt_count: int) -> int | None:
-    """还要等多少秒再试；已到上限返回 None。
+    """按已尝试次数选择下一次等待秒数，达到次数上限就返回 None。
 
     attempt_count 是**后台已经试过**的次数：0 表示只在用户请求里失败过一次
-    （30 秒后由后台接手），4 表示已经自动试满（不再自动试）。
-    """
+    （30 秒后由后台接手），4 表示已经自动试满（不再自动试）。"""
     if attempt_count >= MAX_ATTEMPTS:
         return None
     return BACKOFF_SECONDS[min(max(attempt_count, 0), len(BACKOFF_SECONDS) - 1)]
 
 
 def next_attempt_allowed(attempt_count: int) -> bool:
-    """还允许再自动重试一次吗。"""
+    """检查剩余重试次数，决定是否还允许后台再试一次。"""
     return attempt_count < MAX_ATTEMPTS
 
 
 def degradation_level_for_failure(code: str | None, *, has_evaluation: bool) -> str | None:
-    """失败落在哪一层降级上。
+    """按失败阶段标出降级层级，让用户知道评分或追问受到了什么影响。
 
     评分失败与追问失败必须分开：前者是核心结果缺失（没有分数、不许推进下一题），
     后者只是少问一句（已经有分数了，重试只重跑追问）。混成同一个级别，
-    前端就没法决定"是让用户重答，还是静默续跑"。
-    """
+    前端就没法决定"是让用户重答，还是静默续跑"。"""
     if classify(code) not in ("retryable", "recoverable"):
         return None
     return (

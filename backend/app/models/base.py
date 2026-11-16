@@ -42,5 +42,5 @@ JSONVar = JSON().with_variant(JSONB(), "postgresql")
 
 
 def utcnow() -> datetime:
-    """统一时区时钟，避免各处 datetime.now 写法不一致。"""
+    """取得带 UTC 时区的当前时间，让写库时间口径保持一致。"""
     return datetime.now(timezone.utc)

@@ -1,15 +1,22 @@
-"""新面试流程图的节点（开发说明 §6）。
+"""LangGraph 的逐题状态机节点。
+
+prepare 校验初始题目，dispatch 选择当前题，wait_answer 暂停等待前端；
+evaluate_answer_node 评分，decide_followup_node 用规则决定是否追问；
+build_followup_node 生成追问，advance_node 移到下一题。节点只读写图状态，
+正式事实仍由 PostgreSQL 保存，Redis checkpoint 只保存执行位置。
 
 图的形状（build 见 builder.py）：
 
-    START -> prepare -> dispatch -> wait_answer ─┐
-              ^                     ↑             ↓
-              │                build_followup   evaluate_answer
-              │                     ↑             ↓
-              └──── advance ←───────┴──── decide ─┘
+    START -> prepare -> dispatch -> wait_answer -> evaluate_answer -> decide
+                         ^              ^                            |     |
+                         |              +-- build_followup <--- ask -+     |
+                         |                                                 |
+                         +-- advance <---------------------------- stop ---+
+                                |
+                               END（主问题全部完成）
 
     wait_answer 内部用 interrupt() 暂停，候选人提交答案后用
-    Command(resume=...) 恢复。这是「等待回答不占进程」的关键：
+    Command(resume=...) 恢复。暂停后本次图调用返回，不需要占着线程等用户输入：
     节点里不做模型调用、不写数据库，恢复后从检查点继续。
 
 三条铁律：
@@ -42,7 +49,7 @@ log = get_logger(__name__)
 
 
 def prepare(state: InterviewGraphState) -> dict:
-    """校验并归一化初始输入：预生成的题目集。只在 START 后执行一次。"""
+    """检查已经生成的题目集，并把图的题号初始化到第一道主问题；这里不调出题模型。"""
     raw = state.get("questions") or []
     # 复用 QuestionSet 的全部校验（编号连续 / 无重复 / 权重合法），不信任调用方
     qs = QuestionSet.model_validate({"questions": raw}).sorted_questions()
@@ -57,10 +64,9 @@ def prepare(state: InterviewGraphState) -> dict:
 
 
 def dispatch(state: InterviewGraphState) -> dict:
-    """把下一道主问题装进 pending_question，等待向候选人展示。
+    """按当前主问题编号取题，放进待答题字段，并记录到已问题目清单。
 
-    幂等：只依赖 state 推导，重复执行结果相同（崩溃重放安全）。
-    """
+    幂等：只依赖 state 推导，重复执行结果相同（崩溃重放安全）。"""
     questions = state["questions"]
     idx = state.get("current_main_index", 1)
     if not 1 <= idx <= len(questions):
@@ -71,17 +77,16 @@ def dispatch(state: InterviewGraphState) -> dict:
     pending["kind"] = "main"
     pending["follow_up_index"] = 0
     # 已问清单追加本题主干，供追问 Agent 去重
-    return {"pending_question": pending, "asked_contents": [q["content"]]}
+    return {"pending_question": pending, "asked_contents": [q["content"]], "answer_history": []}
 
 
 # ---------------------------------------------------------------- 等待回答
 
 
 def _public_payload(state: InterviewGraphState) -> dict:
-    """组装给前端的 interrupt payload：刻意剔除 evaluation_rubric。
+    """从图内部题目中挑出可公开字段，去掉内部评分要点后供调用方展示。
 
-    评分要点 = 题目的答案结构，泄露给前端等于泄题（§5/§10）。
-    """
+    评分要点 = 题目的答案结构，泄露给前端等于泄题。"""
     p = state["pending_question"]
     return {
         "session_id": state.get("session_id", ""),
@@ -96,7 +101,7 @@ def _public_payload(state: InterviewGraphState) -> dict:
 
 
 def _normalize_resume(value) -> tuple[str, bool, str | None]:
-    """把 resume 值归一化成 (回答文本, 是否跳过, 错误信息)。"""
+    """把恢复图时传入的内容整理成回答、是否跳过和错误提示三项。"""
     if isinstance(value, dict) and value.get("skipped"):
         return "", True, None
     if isinstance(value, dict):
@@ -114,17 +119,16 @@ def _normalize_resume(value) -> tuple[str, bool, str | None]:
 
 
 def wait_answer(state: InterviewGraphState) -> dict:
-    """暂停点：展示当前题，等待候选人回答。
+    """用 interrupt 保存等待点；下次提交回答时从这里恢复，不占用线程一直等待。
 
     resume 值的约定（前端契约）：
         {"answer": "文本..."}   正常回答
-        {"skipped": true}       跳过本题（不调评分模型，§7.2 规则链第 1 条）
+        {"skipped": true}       跳过本题（不调评分模型，
 
     非法输入（空回答 / 超长）不抛错——节点抛错会把非法 resume 值烧进
     检查点（LangGraph 行为：失败的 resume 值留在 pending writes，重试
     时被重放），正确的做法是带着 error 字段重新 interrupt，客户端修正
-    后再 resume 即可。连续 3 次非法输入才真正抛错（防御异常客户端）。
-    """
+    后再 resume 即可。连续 3 次非法输入才真正抛错（防御异常客户端）。"""
     payload = _public_payload(state)
 
     for _ in range(3):
@@ -142,7 +146,7 @@ def wait_answer(state: InterviewGraphState) -> dict:
 
 
 def _current_targets(state: InterviewGraphState) -> list[str]:
-    """本主问题此前已追问过的方向（用于规则链的重复检查）。"""
+    """收集当前主问题已经追问过的方向，防止再次追问相同缺口。"""
     idx = state.get("current_main_index", 1)
     return [
         d["target"]
@@ -151,23 +155,35 @@ def _current_targets(state: InterviewGraphState) -> list[str]:
     ]
 
 
+def _question_context(state: InterviewGraphState) -> dict:
+    """附加本主问题上下文，不改动已保存题目的独立评分标准。"""
+    pending = dict(state["pending_question"])
+    main = next((q for q in state.get("questions", [])
+                 if q["main_index"] == pending["main_index"]), pending)
+    pending["main_question"] = main["content"]
+    pending["history"] = list(state.get("answer_history", []))
+    return pending
+
+
 def evaluate_answer_node(state: InterviewGraphState) -> dict:
-    """给刚提交的回答评分。skipped 直接记空记录，不调模型（§7.2）。"""
+    """给本次回答调用评分模型；跳过时只追加空评分，不产生模型费用。"""
     if state.get("answer_skipped"):
         return {"evaluations": [None]}
 
-    pending = state["pending_question"]
+    pending = _question_context(state)
     answer = state["latest_answer"]
     # 失败直接抛（ModelCallError / ModelOutputInvalidError）：
     # 检查点停在本节点之前，客户端重试不会产生重复评分记录
     ev = evaluate_answer(pending, answer)
     return {
         "evaluations": [ev.model_dump()],
+        "answer_history": [*state.get("answer_history", []),
+                           {"question": pending["content"], "answer": answer}],
     }
 
 
 def decide_followup_node(state: InterviewGraphState) -> dict:
-    """跑 Python 规则链裁决是否追问。纯逻辑、无模型调用、幂等。"""
+    """根据分数、缺口和追问次数运行 Python 规则，决定继续追问还是换主问题。"""
     ev_dump = state.get("evaluations", [])[-1] if state.get("evaluations") else None
     from app.schemas.evaluation import Evaluation
 
@@ -192,7 +208,7 @@ def decide_followup_node(state: InterviewGraphState) -> dict:
 
 
 def route_after_decision(state: InterviewGraphState) -> Literal["build_followup", "advance"]:
-    """条件边：看规则链最新裁决（列表最后一个元素）。"""
+    """读取最新追问决定，选择生成追问或直接推进主问题。"""
     decisions = state.get("followup_decisions", [])
     last = decisions[-1] if decisions else None
     if last and last["decision"] == "ask":
@@ -204,7 +220,7 @@ def route_after_decision(state: InterviewGraphState) -> Literal["build_followup"
 
 
 def build_followup_node(state: InterviewGraphState) -> dict:
-    """让追问 Agent 生成一个追问并装进 pending_question。
+    """生成并设置下一道追问；服务调用失败上抛，内容生成失败则留痕后跳过追问。
 
     失败策略（区别于评分）：
     - 模型服务不可用（ModelCallError）→ 抛出去让客户端重试；
@@ -214,8 +230,7 @@ def build_followup_node(state: InterviewGraphState) -> dict:
 
     **失败绝不往 followup_decisions 里追加**：那个列表按下标与
     evaluations 对齐（"第几条回答"取"第几条裁决"），多塞一条会让后面
-    所有题的裁决错位一格。留痕走独立的 followup_failures。
-    """
+    所有题的裁决错位一格。留痕走独立的 followup_failures。"""
     from app.schemas.evaluation import Evaluation
 
     pending = state["pending_question"]
@@ -228,7 +243,8 @@ def build_followup_node(state: InterviewGraphState) -> dict:
 
     try:
         fq = generate_followup(
-            pending, state["latest_answer"], evaluation,
+            {**_question_context(state), "history": list(state.get("answer_history", []))[:-1]},
+            state["latest_answer"], evaluation,
             asked_contents=list(state.get("asked_contents", [])),
         )
     except ModelCallError:
@@ -261,8 +277,8 @@ def build_followup_node(state: InterviewGraphState) -> dict:
         "content": fq.content,
         "category": pending.get("category", ""),
         "difficulty": pending.get("difficulty", ""),
-        # 追问仍按主问题的评分要点评（同一个考察面，只是更深）
-        "evaluation_rubric": pending.get("evaluation_rubric", []),
+        # 独立评价本条追问，不能因未重述主问题其他内容而扣分。
+        "evaluation_rubric": [p.model_dump() for p in fq.evaluation_rubric],
         "material_evidence_ids": pending.get("material_evidence_ids", []),
     }
     return {
@@ -274,20 +290,19 @@ def build_followup_node(state: InterviewGraphState) -> dict:
 
 
 def route_after_build_followup(state: InterviewGraphState) -> Literal["wait_answer", "advance"]:
-    """追问生成失败时不能进等待点：
+    """追问生成成功就等待回答，失败就换主问题，避免重复展示刚答过的题。
 
     pending_question 还停留在已答过的题目上，直接 wait_answer 会把
     同一道题再问一遍（候选人重答 → 重复评分 → 死循环隐患）。
     失败就放弃追问，直接推进主流程。
 
     判定用 followup_build_failed（本次覆盖写），不再去翻
-    followup_decisions 的最后一条——那个列表已经不含失败记录了。
-    """
+    followup_decisions 的最后一条——那个列表已经不含失败记录了。"""
     return "advance" if state.get("followup_build_failed") else "wait_answer"
 
 
 def advance_node(state: InterviewGraphState) -> dict:
-    """进入下一道主问题；没有下一道就收尾。"""
+    """主问题编号加一并清零追问次数；没有下一道主问题时标记全部完成。"""
     questions = state["questions"]
     idx = state.get("current_main_index", 1)
     if idx >= len(questions):
@@ -300,4 +315,5 @@ def advance_node(state: InterviewGraphState) -> dict:
 
 
 def route_after_advance(state: InterviewGraphState) -> Literal["dispatch", "__end__"]:
+    """还有题就回到发题节点，全部完成就走图的结束出口。"""
     return "dispatch" if not state.get("finished") else "__end__"

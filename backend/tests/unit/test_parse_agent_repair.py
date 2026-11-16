@@ -69,6 +69,21 @@ def test_valid_output_needs_no_repair():
     assert materials.resume.experiences[0].company == "测试公司"
 
 
+def test_image_sources_follow_attachment_order_even_with_same_filename():
+    parsed = _input()
+    parsed.render_blocks = [
+        RenderBlock(source="resume", label="image.png", data=b"resume-image"),
+        RenderBlock(source="jd", label="image.png", data=b"jd-image"),
+    ]
+    adapter = ScriptedAdapter([json.dumps(VALID_PAYLOAD, ensure_ascii=False)])
+    parse_materials(parsed, adapter=adapter)
+    call = adapter.calls[0]
+    assert "1. 【简历｜source=resume】image.png" in call["user"]
+    assert "2. 【岗位描述(JD)｜source=jd】image.png" in call["user"]
+    assert "属于同一份材料" not in call["user"]
+    assert call["images"] == [b"resume-image", b"jd-image"]
+
+
 def test_schema_error_is_repaired_once_without_resending_resume():
     bad = json.dumps({"resume": {"experiences": "不是数组"}, "evidence": []}, ensure_ascii=False)
     adapter = ScriptedAdapter([bad, json.dumps(VALID_PAYLOAD, ensure_ascii=False)])

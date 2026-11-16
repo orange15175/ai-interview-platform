@@ -26,17 +26,19 @@ from app.models.base import utcnow
 
 
 def normalize_account(account: str) -> str:
-    """账号归一化：去空白 + 转小写（大小写不敏感的唯一性）。"""
+    """去掉账号首尾空白并转小写，让注册与登录使用同一种账号格式。"""
     return (account or "").strip().lower()
 
 
 def get_by_account(db: OrmSession, account: str) -> User | None:
+    """按规范化账号查询用户，不自行验证密码。"""
     return db.scalars(
         select(User).where(User.account == normalize_account(account))
     ).one_or_none()
 
 
 def get(db: OrmSession, user_id: uuid.UUID | str) -> User | None:
+    """按用户 ID 查询账号，令牌有效但用户已不存在时返回 None。"""
     try:
         return db.get(User, uuid.UUID(str(user_id)))
     except (ValueError, AttributeError):
@@ -44,7 +46,7 @@ def get(db: OrmSession, user_id: uuid.UUID | str) -> User | None:
 
 
 def create(db: OrmSession, *, account: str, password: str) -> User:
-    """注册。账号已存在 → AccountTakenError(409)。"""
+    """先哈希密码再创建用户，唯一约束冲突转换成账号已存在的业务错误。"""
     user = User(
         id=uuid.uuid4(),
         account=normalize_account(account),
@@ -62,7 +64,7 @@ def create(db: OrmSession, *, account: str, password: str) -> User:
 
 
 def touch_login(db: OrmSession, user: User) -> User:
-    """记录最近登录时间（只用于展示/排查，不参与鉴权）。"""
+    """更新最近登录时间，只用于展示和排查，不延长已签发令牌。"""
     user.last_login_at = datetime.now(timezone.utc)
     db.flush()
     return user

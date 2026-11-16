@@ -18,6 +18,8 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import datetime, timezone
 
+from sqlalchemy.orm import Session as OrmSession
+
 from app.models import InterviewAnswer, InterviewQuestion, InterviewSession
 from app.repositories import sessions as sessions_repo
 from app.schemas.report import (
@@ -51,11 +53,10 @@ UNCATEGORIZED = "未分类"
 
 
 def _valid_score(answer: InterviewAnswer) -> int | None:
-    """有效评分：完成 + 有分 + 分在合法区间。
+    """只接受已完成回答中的合法整数分数，其余返回 None，不用 0 冒充缺失数据。
 
     跳过（submission_kind=skip）天然没有分，不会走到这里；
-    失败的回答分数为 None，同样被排除。
-    """
+    失败的回答分数为 None，同样被排除。"""
     if answer.processing_status != "COMPLETED":
         return None
     score = answer.score
@@ -67,7 +68,7 @@ def _valid_score(answer: InterviewAnswer) -> int | None:
 
 
 def _excerpt(text: str | None) -> str:
-    """回答摘要：折叠空白后截断。摘要不是全文，报告页不该被长回答淹没。"""
+    """折叠空白并截断回答，生成适合报告展示的短摘要。"""
     if not text:
         return ""
     flat = " ".join(text.split())
@@ -75,15 +76,15 @@ def _excerpt(text: str | None) -> str:
 
 
 def _evaluation_of(answer: InterviewAnswer) -> dict:
+    """确保评分结果是字典；缺失或异常类型时按空评分处理。"""
     return answer.evaluation if isinstance(answer.evaluation, dict) else {}
 
 
 def _dimension_scores(valid: list[tuple[InterviewQuestion, InterviewAnswer]]) -> dict[str, DimensionScore]:
-    """把每条评分的维度分累加起来，返回 (平均分, 样本数)。
+    """分别统计各维度平均分和样本数，缺失维度不按 0 分参与平均。
 
     只统计"有数值"的记录：某些题型（自我介绍、行为题）本来就不给技术维度，
-    用 0 补齐会把平均分拉垮，看起来像能力问题，其实是题型不同。
-    """
+    用 0 补齐会把平均分拉垮，看起来像能力问题，其实是题型不同。"""
     buckets: dict[str, list[int]] = {k: [] for k in DIMENSIONS}
     for _, answer in valid:
         dims = _evaluation_of(answer).get("dimension_scores") or {}
@@ -109,7 +110,7 @@ def _dimension_scores(valid: list[tuple[InterviewQuestion, InterviewAnswer]]) ->
 def _category_summary(
     ordered: list[InterviewQuestion], by_question: dict
 ) -> list[CategorySummary]:
-    """按题目类别聚合。空类别统一归到"未分类"，不要留空字符串制造两个桶。"""
+    """按题目类别统计题数、已完成数和平均分，空类别统一归为未分类。"""
     buckets: dict[str, dict] = defaultdict(
         lambda: {"question_count": 0, "completed_count": 0, "scores": []}
     )
@@ -141,11 +142,10 @@ def _category_summary(
 
 
 def _weak_points(valid: list[tuple[InterviewQuestion, InterviewAnswer]]) -> list[WeakPoint]:
-    """薄弱点 = 反复出现的 missing_points。
+    """统计评分中反复出现的缺失要点，并保留对应题目以便追溯。
 
     完全相同的文字合并计数：同一类缺口在不同题上重复出现，才是"薄弱"的证据；
-    出现一次的更像那道题的特性，不值得写进报告。
-    """
+    出现一次的更像那道题的特性，不值得写进报告。"""
     counter: dict[str, int] = defaultdict(int)
     question_ids: dict[str, list[str]] = defaultdict(list)
 
@@ -172,11 +172,10 @@ def _weak_points(valid: list[tuple[InterviewQuestion, InterviewAnswer]]) -> list
 
 
 def _evidence(valid: list[tuple[InterviewQuestion, InterviewAnswer]]) -> list[AnswerEvidence]:
-    """证据 = 最高分与最低分的回答。
+    """从高分和低分回答中挑选展示证据，附题干、摘要和已有反馈。
 
     只给两头：最高分说明"你做对了什么"，最低分说明"差距在哪"。
-    中间那些同质回答对复盘没有增量信息，给多了只是噪音。
-    """
+    中间那些同质回答对复盘没有增量信息，给多了只是噪音。"""
     if not valid:
         return []
 
@@ -215,10 +214,9 @@ def _suggestions(
     missing_count: int,
     weak_points: list[WeakPoint],
 ) -> list[str]:
-    """程序化建议：由维度短板 + 覆盖率 + 重复缺口推出来，不调模型。
+    """根据维度短板、覆盖率和重复缺口生成规则化建议，不再调模型。
 
-    同一条建议只出一次。宁可少给两条，也不要凑满五条套话。
-    """
+    同一条建议只出一次。宁可少给两条，也不要凑满五条套话。"""
     advice: list[str] = []
 
     for key in DIMENSIONS:
@@ -272,7 +270,7 @@ def build_report(
     answers: list[InterviewAnswer],
     generated_at: datetime | None = None,
 ) -> InterviewReport:
-    """生成报告（纯函数：不查库、不调模型、不写库）。"""
+    """把传入的题目和回答聚合成报告，不查库、不改状态，也不额外生成模型结论。"""
     ordered = sorted(questions, key=lambda q: (q.main_index, q.follow_up_index))
     by_question = {a.question_id: a for a in answers}
 
@@ -348,5 +346,55 @@ def build_report(
 
 
 def is_final_status(session: InterviewSession) -> bool:
-    """会话是否已到终态（报告可视为最终版）。"""
+    """判断会话是否已结束，用来标明报告是阶段性结果还是最终结果。"""
     return session.status in sessions_repo.TERMINAL_STATUSES
+
+
+# ---------------------------------------------------------------- 快照读写
+
+
+def is_cacheable(session: InterviewSession, report: InterviewReport) -> bool:
+    """报告是否已经"不会再变"，可以固化下来。
+
+    两个条件缺一不可：
+    - 会话已终结；
+    - 没有停在 PENDING/PROCESSING 的题（incomplete=0），也没有处理失败的题
+      （failed=0）——失败的题之后可能被补偿任务补完、分数会变。
+
+    只在这时写，是为了让快照**永远不会过期**：之后的写入路径要么被
+    uq_answers_session_question 挡住（每题只交一次），要么不该发生。
+    剩下的边界变化（比如人工改库）走 clear_snapshot 手动清。
+    """
+    s = report.summary
+    return (
+        is_final_status(session)
+        and s.incomplete_count == 0
+        and s.failed_count == 0
+    )
+
+
+def load_snapshot(session: InterviewSession) -> InterviewReport | None:
+    """读取已固化的报告；没有就返回 None，由调用方现场聚合。"""
+    if not session.report_snapshot:
+        return None
+    return InterviewReport.model_validate(session.report_snapshot)
+
+
+def save_snapshot(
+    db: OrmSession, session: InterviewSession, report: InterviewReport
+) -> bool:
+    """把报告写进会话行。返回是否真的写了（不可固化时返回 False，不算错误）。"""
+    if not is_cacheable(session, report):
+        return False
+    session.report_snapshot = report.model_dump(mode="json")
+    db.commit()
+    db.refresh(session)
+    return True
+
+
+def clear_snapshot(db: OrmSession, session: InterviewSession) -> None:
+    """清掉快照，下次读接口重新聚合（评分被改写后用）。"""
+    if session.report_snapshot is None:
+        return
+    session.report_snapshot = None
+    db.commit()

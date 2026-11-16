@@ -1,0 +1,181 @@
+{
+  "parsed": {
+    "resume": {
+      "education": [
+        {
+          "school": "测试大学",
+          "degree": "本科",
+          "major": "计算机",
+          "start": null,
+          "end": null
+        }
+      ],
+      "experiences": [],
+      "projects": [
+        {
+          "name": "个人任务管理系统",
+          "stack": [
+            "Python",
+            "FastAPI",
+            "SQLite"
+          ],
+          "highlights": [
+            "使用Python、FastAPI、SQLite实现任务增删改查与分页。"
+          ],
+          "evidence_ids": [
+            "ev-2"
+          ]
+        }
+      ],
+      "skills": [
+        "Python",
+        "FastAPI"
+      ],
+      "skill_evidence": [
+        {
+          "skill": "Python",
+          "evidence_ids": [
+            "ev-3"
+          ]
+        },
+        {
+          "skill": "FastAPI",
+          "evidence_ids": [
+            "ev-3"
+          ]
+        }
+      ]
+    },
+    "jd": {
+      "responsibilities": [
+        "使用Python开发API"
+      ],
+      "required_skills": [
+        "Python",
+        "Kafka消费者组",
+        "消息处理机制"
+      ],
+      "nice_to_have": [],
+      "experience_years": null
+    },
+    "evidence": [
+      {
+        "id": "ev-1",
+        "source": "resume",
+        "page": 1,
+        "quote": "教育：测试大学，计算机本科。"
+      },
+      {
+        "id": "ev-2",
+        "source": "resume",
+        "page": 1,
+        "quote": "项目：个人任务管理系统，使用Python、FastAPI、SQLite实现任务增删改查与分页。"
+      },
+      {
+        "id": "ev-3",
+        "source": "resume",
+        "page": 1,
+        "quote": "技能：Python、FastAPI。"
+      },
+      {
+        "id": "ev-4",
+        "source": "jd",
+        "page": 1,
+        "quote": "后端开发岗位：使用Python开发API"
+      },
+      {
+        "id": "ev-5",
+        "source": "jd",
+        "page": 1,
+        "quote": "要求掌握Kafka消费者组和消息处理机制。"
+      }
+    ],
+    "uncertain_fields": [],
+    "warnings": [
+      "简历未提供工作经历，experiences为空。",
+      "简历未提供教育起止时间，start/end为null。",
+      "JD未提供经验年限，experience_years为null。"
+    ]
+  },
+  "jd_evidence_present": true,
+  "questions": {
+    "questions": [
+      {
+        "main_index": 1,
+        "kind": "main",
+        "category": "项目经验",
+        "difficulty": "medium",
+        "content": "你在个人任务管理系统里用 FastAPI 和 SQLite 实现了任务增删改查和分页，能具体讲讲分页是怎么做的吗？比如分页参数怎么传入、SQL 层怎么查询、返回结构怎么设计。",
+        "material_evidence_ids": [
+          "ev-2",
+          "ev-3"
+        ],
+        "evaluation_rubric": [
+          {
+            "point": "说明分页参数（如 page/page_size 或 limit/offset）如何通过查询参数传入并做校验",
+            "weight": 0.35
+          },
+          {
+            "point": "说明 SQL 层使用 LIMIT/OFFSET 或等价方式实现分页，并提到排序字段以保证结果稳定",
+            "weight": 0.35
+          },
+          {
+            "point": "返回结构包含数据列表与总数或是否还有下一页等信息，能说清设计理由",
+            "weight": 0.3
+          }
+        ]
+      },
+      {
+        "main_index": 2,
+        "kind": "main",
+        "category": "专业能力",
+        "difficulty": "medium",
+        "content": "岗位要求掌握 Kafka 消费者组和消息处理机制。如果多个消费者实例订阅同一个 topic，Kafka 是怎么把分区分配给它们的？某个消费者实例挂掉后又会发生什么？",
+        "material_evidence_ids": [
+          "ev-5"
+        ],
+        "evaluation_rubric": [
+          {
+            "point": "说明同一消费者组内一个分区同一时刻只被一个消费者消费，组内实现负载均衡",
+            "weight": 0.35
+          },
+          {
+            "point": "说明分区分配由组协调者通过 rebalance 完成，分配策略可提及 range/round-robin/sticky 等任一合理方案",
+            "weight": 0.35
+          },
+          {
+            "point": "说明消费者掉线后触发 rebalance，其分区被重新分配给存活消费者，并提到 offset 提交与重复消费的关系（加分项）",
+            "weight": 0.3
+          }
+        ]
+      },
+      {
+        "main_index": 3,
+        "kind": "main",
+        "category": "场景解决",
+        "difficulty": "hard",
+        "content": "假设你要用 Python 写一个消费 Kafka 消息并调用下游 API 的服务，下游接口可能超时或失败。你会怎么设计消息处理流程来保证消息尽量不丢、又不会因为重试把下游打垮？",
+        "material_evidence_ids": [
+          "ev-4",
+          "ev-5"
+        ],
+        "evaluation_rubric": [
+          {
+            "point": "明确消费成功后手动提交 offset，失败时不提交或提交到死信/重试队列，避免消息丢失",
+            "weight": 0.35
+          },
+          {
+            "point": "对下游调用设计重试策略（如指数退避、最大重试次数），并说明重试与 offset 提交的先后关系",
+            "weight": 0.35
+          },
+          {
+            "point": "提到幂等处理（如业务唯一键或去重表）以应对至少一次投递导致的重复消费，或提到限流/并发控制保护下游（任一合理方案即可）",
+            "weight": 0.3
+          }
+        ]
+      }
+    ]
+  },
+  "technical_only": true,
+  "real_vision": true
+}

@@ -33,15 +33,14 @@ from app.graph.state import InterviewGraphState
 def build_interview_graph(
     checkpointer: BaseCheckpointSaver | None = None, *, restore: bool = False
 ):
-    """编译面试图。
+    """连接各个节点并编译图；正常入口先校验题目，恢复入口直接进入等待回答。
 
     checkpointer 决定会话存在哪（Memory / Redis）。
     restore=True 时编译**恢复变体**：START 直接进 wait_answer，跳过
     prepare/dispatch。用于 Redis checkpoint 丢失后从 PostgreSQL 重建
-    （§9.4）——由调用方把材料/题目/已答记录/进度直接作为 invoke 的初始
+    ——由调用方把材料/题目/已答记录/进度直接作为 invoke 的初始
     state 灌进去，图会真的在 wait_answer 处 interrupt，后续仍走
-    Command(resume=...)，而不是"往空 thread 里塞字段假装恢复"。
-    """
+    Command(resume=...)，而不是"往空 thread 里塞字段假装恢复"。"""
     builder = StateGraph(InterviewGraphState)
 
     builder.add_node("prepare", nodes.prepare)

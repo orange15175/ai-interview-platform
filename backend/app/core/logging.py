@@ -11,7 +11,7 @@ _CONFIGURED = False
 
 
 def setup_logging(level: str = "INFO") -> None:
-    """进程内只配置一次，重复调用无副作用。"""
+    """给进程安装统一日志格式，重复调用时不再叠加处理器。"""
     global _CONFIGURED
     if _CONFIGURED:
         return
@@ -33,4 +33,5 @@ def setup_logging(level: str = "INFO") -> None:
 
 
 def get_logger(name: str) -> logging.Logger:
+    """按模块名取得日志对象，让日志能定位到具体来源。"""
     return logging.getLogger(name)

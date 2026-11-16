@@ -15,6 +15,7 @@ class AppError(Exception):
 
     def __init__(self, message: str, *, code: str | None = None,
                  http_status: int | None = None, retryable: bool = False):
+        """保存提示、错误码、HTTP 状态和能否重试，供统一异常处理器生成响应。"""
         super().__init__(message)
         self.message = message
         if code:
@@ -24,6 +25,7 @@ class AppError(Exception):
         self.retryable = retryable
 
     def to_dict(self) -> dict:
+        """只输出错误码、可读提示和重试标记，避免把异常堆栈发给前端。"""
         return {"code": self.code, "message": self.message, "retryable": self.retryable}
 
 
@@ -37,6 +39,7 @@ class MaterialInsufficientError(AppError):
     http_status = 422
 
     def __init__(self, message: str = "简历内容不足，无法出题，请换一份内容完整的简历"):
+        """创建“材料读出来了，但内容不足以出题（没有教育/经历/项目）”业务异常，并沿用本类错误码。"""
         super().__init__(message)
 
 
@@ -51,6 +54,7 @@ class UnreadableMaterialError(MaterialInsufficientError):
     code = "UNREADABLE_MATERIAL"
 
     def __init__(self, message: str = "没有可解析的材料，请重新上传简历"):
+        """创建“材料根本读不出来（空文档 / 损坏 / 完全没有可识别内容）”业务异常，并沿用本类错误码。"""
         super().__init__(message)
 
 
@@ -62,6 +66,7 @@ class ModelCallError(AppError):
 
     def __init__(self, message: str = "模型服务暂时不可用，请稍后重试",
                  *, code: str | None = None):
+        """创建“模型调用失败（超时/网络/供应商 5xx）”业务异常，并沿用本类错误码。"""
         super().__init__(message, retryable=True, code=code)
 
 
@@ -78,11 +83,10 @@ class ModelUnavailableError(ModelCallError):
 
 
 def classify_model_exception(exc: BaseException, *, message: str) -> ModelCallError:
-    """把供应商/网络异常归类成稳定错误码。
+    """把模型供应商或网络异常归为超时或不可用，保持对外错误码稳定。
 
     超时与"服务不可用"对用户是两件事：前者重试往往就好，后者要等运维。
-    但对调用方都必须是可重试错误，绝不能变成 0 分。
-    """
+    但对调用方都必须是可重试错误，绝不能变成 0 分。"""
     name = type(exc).__name__.lower()
     text = str(exc).lower()
     timeout_markers = ("timeout", "timedout", "readtimeout", "apitimeouterror")
@@ -98,6 +102,7 @@ class ModelOutputInvalidError(AppError):
     http_status = 502
 
     def __init__(self, message: str = "模型输出格式异常，请重试"):
+        """创建“模型输出结构不合法（校验失败）”业务异常，并沿用本类错误码。"""
         super().__init__(message, retryable=True)
 
 
@@ -116,6 +121,7 @@ class SessionNotFoundError(AppError):
     http_status = 404
 
     def __init__(self, message: str = "会话不存在，或无权访问"):
+        """创建“会话不存在，或不属于当前访客”业务异常，并沿用本类错误码。"""
         super().__init__(message)
 
 
@@ -126,6 +132,7 @@ class SessionFinishedError(AppError):
     http_status = 409
 
     def __init__(self, message: str = "会话已结束，不能再提交回答"):
+        """创建“会话已结束（含正常完成、主动结束、取消、过期），不再接受答题”业务异常，并沿用本类错误码。"""
         super().__init__(message)
 
 
@@ -136,6 +143,7 @@ class SessionExpiredError(AppError):
     http_status = 410
 
     def __init__(self, message: str = "会话已过期，请重新创建面试"):
+        """创建“匿名访客凭证或会话超过留存期”业务异常，并沿用本类错误码。"""
         super().__init__(message)
 
 
@@ -149,6 +157,7 @@ class SessionBusyError(AppError):
     http_status = 409
 
     def __init__(self, message: str = "该会话正在处理上一条提交，请稍后重试"):
+        """创建“同一会话有另一个请求正在推进（会话锁未拿到）”业务异常，并沿用本类错误码。"""
         super().__init__(message, retryable=True)
 
 
@@ -162,6 +171,7 @@ class RequestConflictError(AppError):
     http_status = 409
 
     def __init__(self, message: str = "该请求编号已用于另一次提交，请刷新后重试"):
+        """创建“同一 request_id 携带了不同输入（客户端 bug 或重放）”业务异常，并沿用本类错误码。"""
         super().__init__(message)
 
 
@@ -172,6 +182,7 @@ class StaleQuestionError(AppError):
     http_status = 409
 
     def __init__(self, message: str = "提交的题目已过期，请刷新获取当前题"):
+        """创建“提交的题目已不是当前题，或该题已提交过（首期一题一次）”业务异常，并沿用本类错误码。"""
         super().__init__(message)
 
 
@@ -185,6 +196,7 @@ class VersionConflictError(AppError):
     http_status = 409
 
     def __init__(self, message: str = "会话状态已被更新，请刷新后重试"):
+        """创建“state_version 不匹配：锁租约失效后旧请求想写入（§9.2 CAS）”业务异常，并沿用本类错误码。"""
         super().__init__(message, retryable=True)
 
 
@@ -202,6 +214,7 @@ class WriteFenceLostError(AppError):
     http_status = 409
 
     def __init__(self, message: str = "本次处理已失去写入权限，请用同一请求编号重试"):
+        """创建“数据库写入代次（write_epoch）已变：本次请求的写入资格被接管者收回”业务异常，并沿用本类错误码。"""
         super().__init__(message, retryable=True)
 
 
@@ -215,6 +228,7 @@ class StateRecoveryRequiredError(AppError):
     http_status = 409
 
     def __init__(self, message: str = "会话执行状态缺失，需要从记录恢复后才能继续"):
+        """创建“Redis checkpoint 缺失/损坏，需要用恢复入口从 PostgreSQL 重建（§9.4）”业务异常，并沿用本类错误码。"""
         super().__init__(message, retryable=True)
 
 
@@ -228,6 +242,7 @@ class LockUnavailableError(AppError):
     http_status = 503
 
     def __init__(self, message: str = "会话锁服务暂时不可用，请稍后重试"):
+        """创建“Redis 不可用：拿不到会话锁时**不允许**降级为无锁写入（§9.2）”业务异常，并沿用本类错误码。"""
         super().__init__(message, retryable=True)
 
 
@@ -241,6 +256,7 @@ class CsrfRejectedError(AppError):
     http_status = 403
 
     def __init__(self, message: str = "请求来源校验失败"):
+        """创建“写操作的 Origin/Referer 与服务端不一致（§11 CSRF 防护）”业务异常，并沿用本类错误码。"""
         super().__init__(message)
 
 
@@ -256,6 +272,7 @@ class AccountTakenError(AppError):
     http_status = 409
 
     def __init__(self, message: str = "该账号已被注册，请换一个"):
+        """创建“账号已被占用（唯一约束冲突）”业务异常，并沿用本类错误码。"""
         super().__init__(message)
 
 
@@ -270,6 +287,7 @@ class InvalidCredentialsError(AppError):
     http_status = 401
 
     def __init__(self, message: str = "账号或密码不正确"):
+        """创建“账号或密码错误”业务异常，并沿用本类错误码。"""
         super().__init__(message)
 
 
@@ -280,4 +298,5 @@ class AuthRequiredError(AppError):
     http_status = 401
 
     def __init__(self, message: str = "请先登录"):
+        """创建“需要登录后才能访问（未登录 / 令牌过期 / 令牌被篡改）”业务异常，并沿用本类错误码。"""
         super().__init__(message)

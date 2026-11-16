@@ -38,6 +38,7 @@ class Experience(BaseModel):
     @field_validator("highlights")
     @classmethod
     def _strip(cls, v: list[str]) -> list[str]:
+        """清理经历亮点的首尾空白并删除空项，让后续提示词更干净。"""
         return [x.strip() for x in v if x and x.strip()]
 
 
@@ -65,7 +66,7 @@ class ResumeProfile(BaseModel):
     @field_validator("skills")
     @classmethod
     def _dedup_skills(cls, v: list[str]) -> list[str]:
-        """去重但保持原顺序；模型常把同一技能写两遍。"""
+        """忽略大小写去重技能名，同时保留原有顺序。"""
         seen: set[str] = set()
         out: list[str] = []
         for s in v:
@@ -78,11 +79,11 @@ class ResumeProfile(BaseModel):
 
     @property
     def is_empty(self) -> bool:
-        """内容不足的信号：没有任何教育/经历/项目，说明解析失败或简历无效。"""
+        """没有教育、工作经历和项目时返回 True，用于判断材料是否不足以出题。"""
         return not (self.education or self.experiences or self.projects)
 
     def to_prompt_json(self) -> dict:
-        """给模型看的精简结构：不含 evidence，避免上下文膨胀。"""
+        """把简历对象转成可序列化字典；完整证据原文清单位于外层材料对象。"""
         return self.model_dump(mode="json")
 
 
@@ -109,10 +110,12 @@ class ParsedMaterials(BaseModel):
     @field_validator("evidence")
     @classmethod
     def _unique_evidence_ids(cls, v: list[Evidence]) -> list[Evidence]:
+        """拒绝重复的依据 ID，避免一个编号同时指向两段不同材料。"""
         ids = [e.id for e in v]
         if len(ids) != len(set(ids)):
             raise ValueError("evidence id 重复：题目引用会指向歧义依据")
         return v
 
     def evidence_index(self) -> set[str]:
+        """取出所有有效依据 ID，供出题和引用清理快速检查。"""
         return {e.id for e in self.evidence}

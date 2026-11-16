@@ -30,16 +30,15 @@ Action = Literal["proceed", "replay", "resume", "conflict"]
 
 
 def normalize_answer(answer: str | None) -> str:
-    """回答归一化：去掉所有空白后比较。
+    """移除回答中的空白字符，让只有空白差异的重试被视为同一内容。
 
     用户"重新提交同一段话"时可能多了换行/空格，那不算不同输入；
-    反过来，内容有实质变化就必须判冲突，不能悄悄覆盖。
-    """
+    反过来，内容有实质变化就必须判冲突，不能悄悄覆盖。"""
     return "".join((answer or "").split())
 
 
 def input_fingerprint(*, answer: str | None, skipped: bool) -> str:
-    """输入指纹：区分"同一 request_id 携带不同输入"（§9.3 第 2 条）。"""
+    """给回答和跳过标记生成哈希，用于检查同一请求 ID 是否偷偷换了内容。"""
     payload = "skip" if skipped else f"answer:{normalize_answer(answer)}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -56,15 +55,14 @@ def classify_submission(
     input_hash: str,
     question_id,
 ) -> SubmissionCheck:
-    """根据已有回答行判定本次提交该怎么走。
+    """结合旧回答状态、输入哈希和题目 ID，区分新提交、续跑、结果回放和冲突。
 
     - 无已有行          → proceed（正常新提交）
     - 输入指纹不同      → conflict（同 ID 不同内容，客户端 bug 或重放攻击）
     - 题目不同          → conflict（同一个 request_id 不能换题）
     - 已完成            → replay（直接返回上次响应，不再跑模型）
     - 未完成（FAILED/PENDING/PROCESSING）
-                        → resume（复用已保存的阶段结果，从中断处继续）
-    """
+                        → resume（复用已保存的阶段结果，从中断处继续）"""
     if existing is None:
         return SubmissionCheck("proceed", "新请求")
 
@@ -84,11 +82,12 @@ def classify_submission(
 
 
 def cache_key(session_id, request_id: str) -> str:
+    """按会话和请求 ID 生成响应缓存键，防止不同提交互相覆盖。"""
     return app_key("idem", str(session_id), str(request_id))
 
 
 def get_cached(client: Redis | None, session_id, request_id: str) -> dict | None:
-    """读缓存；Redis 异常当作未命中（缓存不是正确性来源）。"""
+    """尝试读取已有响应；缓存故障视为未命中，仍可回数据库找正式快照。"""
     if client is None:
         return None
     try:
@@ -107,7 +106,7 @@ def get_cached(client: Redis | None, session_id, request_id: str) -> dict | None
 def put_cached(
     client: Redis | None, session_id, request_id: str, payload: dict
 ) -> None:
-    """写缓存（带 TTL）。失败只记日志：正式记录已在 PG，缓存丢了不影响幂等。"""
+    """带过期时间缓存已完成响应；缓存写失败不会撤销已提交的数据库结果。"""
     if client is None:
         return
     ttl_seconds = int(get_settings().business.idempotency_ttl_hours) * 3600
@@ -122,6 +121,7 @@ def put_cached(
 
 
 def drop_cached(client: Redis | None, session_id, request_id: str) -> None:
+    """尽力删除某次响应缓存，Redis 故障直接忽略，不影响正式记录。"""
     if client is None:
         return
     try:

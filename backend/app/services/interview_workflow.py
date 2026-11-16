@@ -1,4 +1,10 @@
-"""面试流程编排：启动、提交回答（开发说明 §9.3 逐条落地）。
+"""逐题面试的业务编排。
+
+这个模块回答一个问题：一次回答怎样安全地从“收到”走到“下一题”。
+submit_answer 是总入口；_register_new_answer 先登记待处理记录；
+_run_and_persist 负责调用图并处理结果；_finalize 负责最终落库。
+resume_claimed_answer 给后台补偿进程使用，但复用同一条收尾路径。
+锁、write_epoch、state_version 和 request_id 分工不同，检查顺序不能随意改变。
 
 这一层不实现 HTTP，只实现"一次业务动作要做完哪些事、按什么顺序、失败怎么收场"。
 API 层（阶段 5）拿到 session_id/visitor_id 后调用这里；CLI 与测试也调这里。
@@ -54,11 +60,10 @@ log = get_logger(__name__)
 
 
 def public_evaluation(evaluation: dict | None) -> dict | None:
-    """评分对外投影：**剔除 rubric_results**。
+    """给前端挑出分数、反馈和维度分，过滤内部 rubric_results。
 
     rubric_results 是"评分要点 + 是否满足"，等于把答案结构告诉了候选人
-    （§10：不得向前端输出私有评分标准）。分数、反馈、维度分可以给。
-    """
+    。分数、反馈、维度分可以给。"""
     if not evaluation:
         return None
     return {
@@ -71,7 +76,7 @@ def public_evaluation(evaluation: dict | None) -> dict | None:
 
 
 def public_decision(decision: dict | None) -> dict | None:
-    """裁决对外投影：只给结论与稳定原因码，不给内部 detail 文案。"""
+    """只公开追问决定和原因码，不返回内部判断细节。"""
     if not decision:
         return None
     return {
@@ -81,7 +86,7 @@ def public_decision(decision: dict | None) -> dict | None:
 
 
 def public_degradation(answer_row) -> dict | None:
-    """降级信息的对外投影：只说"哪一层降级了、为什么"，不带内部提示词或分数。"""
+    """返回本次流程在哪一层发生了降级，方便前端说明结果限制。"""
     level = getattr(answer_row, "degradation_level", None)
     if not level:
         return None
@@ -94,11 +99,10 @@ def public_degradation(answer_row) -> dict | None:
 def _next_question_payload(
     db: OrmSession, session_id: uuid.UUID, payload: dict | None, state_values: dict
 ) -> dict | None:
-    """把中断 payload 落成"带 question_id 的公开题目"。
+    """把图返回的下一题关联到数据库题目 ID；新追问在这里补写题目记录。
 
     主问题的行在准备阶段已入库；追问是图里现生成的，必须在这里补一行，
-    否则恢复时无题可重建（§8 一题一行）。
-    """
+    否则恢复时无题可重建。"""
     if not payload:
         return None
     main_index = payload["main_index"]
@@ -128,7 +132,7 @@ def _next_question_payload(
 
 
 def _progress(state_values: dict, payload: dict | None, *, finished: bool) -> dict:
-    """受控的恢复进度（§8 末段）：重建时要靠它，不是只给页面看的字段。"""
+    """从图状态整理当前题号、已评分数和跳过数，作为会话进度保存。"""
     answered = sum(1 for e in state_values.get("evaluations", []) if e is not None)
     skipped = sum(1 for e in state_values.get("evaluations", []) if e is None)
     base = {
@@ -155,11 +159,10 @@ def start_interview(
     session: InterviewSession,
     questions: QuestionSet | list[GeneratedQuestion],
 ) -> dict:
-    """题目入库 → 启动图 → 停在第一题的等待点。
+    """保存主问题，启动图到第一题等待点，再更新会话状态和当前题 ID。
 
     图的初始 state 只放 session_id 与题目（模型已经在准备阶段调用过，
-    图里不再重复解析/出题）。返回的 payload 已带 question_id。
-    """
+    图里不再重复解析/出题）。返回的 payload 已带 question_id。"""
     qs = (
         questions.sorted_questions()
         if isinstance(questions, QuestionSet)
@@ -179,8 +182,8 @@ def start_interview(
     state_values, _, _ = graph_runtime.snapshot_state(graph, session.id)
     view = _next_question_payload(db, session.id, payload, state_values)
 
-    # 启动也是一次会话写入：取得栅栏，版本推进必须带 epoch，
-    # 否则两个并发的"重试出题"能各自把同一场面试启动成两个不同的题序。
+    # 当前到这里才取得写入代次：它约束后续数据库状态更新，
+    # 不能保护上面已经发生的 graph.invoke，也不能阻止并发重试同时生成题目。
     fence = sessions_repo.begin_write(db, session)
     sessions_repo.check_fence(session, fence)
     sessions_repo.touch(
@@ -224,7 +227,7 @@ def submit_answer(
     user_id: uuid.UUID | str | None = None,
     redis_client=None,
 ) -> dict:
-    """提交一次回答（或跳过），推进到下一题或结束。
+    """组织一次答题：确认身份、判断重复、加锁、登记回答、执行图并保存结果。
 
     user_id：登录用户身份（可选）。带上它就允许"换浏览器重新登录后继续答"，
     不带则只认匿名访客 Cookie，行为与之前完全一致。
@@ -233,8 +236,7 @@ def submit_answer(
     归属校验 → 题目校验 → 幂等判定（回放/冲突）→ 终态检查。
     幂等回放必须排在终态检查**之前**：最后一题提交成功但响应丢失时，会话
     已经是 FINISHED，若先查终态就会把"我要拿回上一次的结果"变成
-    SESSION_FINISHED，用户永远拿不回那份评分。
-    """
+    SESSION_FINISHED，用户永远拿不回那份评分。"""
     if not request_id or len(request_id) > 64:
         raise RequestConflictError("request_id 缺失或过长（<=64 字符）")
 
@@ -255,7 +257,7 @@ def submit_answer(
     if check.action == "replay":
         return _replay_response(db, session.id, request_id, redis_client)
 
-    # 到这里一定是"要真正处理"（新提交或续跑），终态检查才有意义
+    # 已完成结果先回放；只有确实要继续处理时，才检查会话能否继续答题。
     sessions_repo.assert_can_answer(session)
 
     lock = locks.acquire(str(session.id))
@@ -325,7 +327,7 @@ def resume_claimed_answer(
     lock: locks.SessionLock,
     redis_client=None,
 ) -> dict:
-    """后台补偿专用入口：把一条**已被抢占**的失败提交跑完。
+    """让后台补偿使用原回答和原请求 ID 续跑，复用正常答题的收尾逻辑。
 
     与用户手动重试共用同一条收尾路径（_run_and_persist），差别只有两点：
     1. 用的是数据库里存的原始回答与原始 request_id，绝不用新 id——
@@ -334,8 +336,7 @@ def resume_claimed_answer(
        跑模型之前再确认一次"会话没有结束、这条回答还没完成"。
 
     执行前必须重新取得写入栅栏：worker 排队等锁的这段时间里，
-    完全可能已经有别的执行者把这场面试推进了。
-    """
+    完全可能已经有别的执行者把这场面试推进了。"""
     question = questions_repo.get(db, answer_row.question_id)
     if question is None or question.session_id != session.id:
         raise StateRecoveryRequiredError("回答所属题目已不存在，无法补偿")
@@ -367,7 +368,7 @@ def _register_new_answer(
     skipped: bool,
     expected_state_version: int | None,
 ) -> InterviewAnswer:
-    """登记新回答（短事务）。两道防线：先读后写 + 唯一约束兜底。"""
+    """确认提交的是当前题且没有答过，再用短事务登记一条待处理回答。"""
     prev = answers_repo.get_by_question(db, session.id, question.id)
     if prev is not None:
         raise StaleQuestionError("该题已提交过（首期一题一次），请刷新获取当前题")
@@ -416,13 +417,14 @@ class AnswerPosition:
 
     @property
     def coords(self) -> tuple[int, int]:
+        """返回主问题号和追问号，供数据库题序与图中等待位置对比。"""
         return (self.main_index, self.follow_up_index)
 
 
 def _answer_position(
     db: OrmSession, session_id: uuid.UUID, question
 ) -> AnswerPosition:
-    """按题序算出这条回答的位置，以及它之前已经完成的回答条数。"""
+    """计算本题在完整题序中的位置，以及它之前已经完成的回答数量。"""
     ordered = questions_repo.list_for_session(db, session_id)
     ordered.sort(key=lambda q: (q.main_index, q.follow_up_index))
     index = next(
@@ -446,7 +448,7 @@ def _answer_position(
 
 
 def _stage_result(values: dict, index: int) -> tuple[dict | None, dict | None]:
-    """从图状态里按位置取本次回答的评分与裁决（越界返回 None，不猜）。"""
+    """按题序下标取本次评分和追问决定，找不到就返回空值，不拿别题结果冒充。"""
     evaluations = values.get("evaluations") or []
     decisions = values.get("followup_decisions") or []
     evaluation = evaluations[index] if 0 <= index < len(evaluations) else None
@@ -455,11 +457,10 @@ def _stage_result(values: dict, index: int) -> tuple[dict | None, dict | None]:
 
 
 def _followup_failure(values: dict, position: AnswerPosition) -> dict | None:
-    """这一题之后本该生成的那次追问失败了吗（追问是可选环节的降级证据）。
+    """按主问题号和追问号查找本题之后那次追问是否生成失败。
 
     坐标用"被答完的题"（main_index, follow_up_index），而不是失败记录自己的
-    主/追对：失败的那个追问根本没生成，没有自己的坐标。
-    """
+    主/追对：失败的那个追问根本没生成，没有自己的坐标。"""
     for item in values.get("followup_failures") or []:
         if not isinstance(item, dict):
             continue
@@ -485,7 +486,7 @@ def _run_and_persist(
     redis_client,
     fence: sessions_repo.WriteFence | None = None,
 ) -> dict:
-    """跑图 + 落阶段结果 + CAS 推进版本。模型调用不放在数据库事务里。
+    """先看图停在哪里，再选择恢复回答、续跑失败节点或补写已经生成的结果。
 
     这里最要紧的一件事：**先对账，再决定跑不跑**。
     以前只要"没有 pending interrupt"就 continue_run，于是"图已经推进到下一题、
@@ -494,8 +495,7 @@ def _run_and_persist(
     - 停在等待点但等的是别的题    → 图已消费过这次回答，只补写，绝不重投；
     - 节点失败（无 interrupt）    → continue_run，只重跑失败节点（评分不重算）；
     - 图已跑完                    → 只补写最终响应；
-    - 没有 checkpoint             → STATE_RECOVERY_REQUIRED。
-    """
+    - 没有 checkpoint             → STATE_RECOVERY_REQUIRED。"""
     snap = graph_runtime.snapshot(graph, session.id)
     if snap.stage == graph_runtime.GRAPH_MISSING:
         answers_repo.fail(
@@ -585,7 +585,7 @@ def _run_and_persist(
 def _wait_question_id(
     db: OrmSession, session_id: uuid.UUID, snap: graph_runtime.GraphSnapshot
 ) -> uuid.UUID | None:
-    """把中断里的 (主问题, 追问) 坐标翻成数据库题目 id（查不到返回 None）。"""
+    """把图里等待题目的编号转换成数据库题目 ID，方便记录执行位置。"""
     if snap.wait_main_index is None or snap.wait_follow_up_index is None:
         return None
     row = questions_repo.get_by_index(
@@ -606,11 +606,10 @@ def _rebuild_from_state(
     redis_client,
     fence: sessions_repo.WriteFence | None = None,
 ) -> dict:
-    """图已消费过这次回答，但数据库没写全：从图状态补齐，**不重投旧回答**。
+    """图已处理回答但数据库未写全时，只从图中补取结果，不把旧回答投给下一题。
 
     校验很硬：图状态里必须真的存在"第 index 条评分"。缺了就是不匹配，
-    宁可要求恢复，也不凭空编一个分数。
-    """
+    宁可要求恢复，也不凭空编一个分数。"""
     values = snap.values
     evaluations = values.get("evaluations") or []
     if position.completed_before >= len(evaluations):
@@ -639,11 +638,10 @@ def _persist_partial(
     *,
     fence: sessions_repo.WriteFence | None = None,
 ) -> None:
-    """失败也要把已成功的阶段写下来，供重试/恢复复用（§9.3 第 6 条）。
+    """模型流程失败时保存已得到的评分、裁决和错误，供后续重试复用。
 
     这里的写入同样受写入栅栏约束：**失败**也是一种结论，一个丢了写入资格的
-    请求不该把"这条回答失败"的事实按在别人刚推进的会话上。
-    """
+    请求不该把"这条回答失败"的事实按在别人刚推进的会话上。"""
     values, _, _ = graph_runtime.snapshot_state(graph, session.id)
     evaluation, decision = _stage_result(values, position.index)
     _save_stage_results(
@@ -673,7 +671,7 @@ def _save_stage_results(
     decision: dict | None,
     followup_failure: dict | None = None,
 ) -> None:
-    """把图状态里的评分/裁决写进回答行（幂等：同样的值重复写不会变）。"""
+    """把图中的评分和追问决定写入回答记录，并补充模型版本与降级信息。"""
     if evaluation is not None or answer_row.evaluation is None:
         score = evaluation.get("score") if isinstance(evaluation, dict) else None
         answers_repo.save_evaluation(db, answer_row, evaluation=evaluation, score=score)
@@ -682,7 +680,7 @@ def _save_stage_results(
             answers_repo.record_evaluation_meta(
                 db, answer_row,
                 model_name=settings.text_model.model,
-                prompt_version="v1",
+                prompt_version=evaluation.get("prompt_version") or "v1",
             )
     if decision is not None:
         answers_repo.save_decision(db, answer_row, decision=decision)
@@ -699,12 +697,11 @@ def _save_stage_results(
 def _bump_or_rollback(
     db: OrmSession, session: InterviewSession, *, fence: sessions_repo.WriteFence | None = None
 ) -> int:
-    """CAS 推进版本；被拒（栅栏丢失/版本冲突）时先撤销本次写入再抛。
+    """带写入代次推进状态版本；条件更新失败就回滚本事务，防止留下半份结果。
 
     为什么必须有这一步：条件更新只拦住了**会话行**，回答行、追问题目行的
     写入还在同一个事务里挂着。不回滚就 raise，调用方一旦 commit 就会留下
-    "评分写进去了、会话没推进"的半截状态——这正是恢复流程最讨厌的形态。
-    """
+    "评分写进去了、会话没推进"的半截状态——这正是恢复流程最讨厌的形态。"""
     try:
         return sessions_repo.bump_state_version(db, session, fence=fence)
     except AppError:
@@ -724,7 +721,7 @@ def _persist_success(
     redis_client,
     fence: sessions_repo.WriteFence | None = None,
 ) -> dict:
-    """跑图成功：交给 _finalize 落库（与"补写"共用同一条收尾路径）。"""
+    """从执行成功的图中提取状态和下一题，再交给统一收尾函数。"""
     values = result if isinstance(result, dict) else {}
     payload = graph_runtime.interrupt_payload(result)
     return _finalize(
@@ -748,7 +745,7 @@ def _finalize(
     rebuilt: bool,
     fence: sessions_repo.WriteFence | None = None,
 ) -> dict:
-    """成功收尾：阶段结果 → 下一题落库 → 锁/栅栏检查 → CAS → 快照 → 缓存。"""
+    """在锁和版本检查通过后，一起提交评分、正式回答、当前题和可回放响应。"""
     finished = payload is None
     evaluation, decision = _stage_result(values, position.index)
     failure = _followup_failure(values, position)
@@ -778,7 +775,8 @@ def _finalize(
         finished=finished,
     )
 
-    # 对外裁决要"实话实说"：规则链说该追问，但追问生成失败了、最终没问，
+    # 提交数据库之前先组装快照，保证网络断开后仍能按原 request_id 取回相同结果。
+    # 规则链说该追问，但追问生成失败了、最终没问，
     # 那对外就报 FOLLOWUP_FAILED（内部 rule_decision 保留规则链原判，供复盘）。
     effective_decision = decision
     if failure is not None:
@@ -820,7 +818,7 @@ def _finalize(
 def _replay_response(
     db: OrmSession, session_id: uuid.UUID, request_id: str, redis_client
 ) -> dict:
-    """同 request_id 重试且已完成：原样返回上次响应，不推进、不调模型。"""
+    """优先读 Redis，再读数据库响应快照，返回同一次提交的既有结果。"""
     cached = idempotency.get_cached(redis_client, session_id, request_id)
     if cached:
         return {**cached, "replayed": True}
@@ -836,7 +834,7 @@ def _replay_response(
 def build_progress_view(
     *, db: OrmSession, graph: CompiledStateGraph, session: InterviewSession
 ) -> dict:
-    """查询接口的进度投影（只读，不推进题号，§6.2 末条）。"""
+    """读取正式记录并组装前端进度，不调用模型、不推进当前题。"""
     current = None
     if session.current_question_id is not None:
         row = questions_repo.get(db, session.current_question_id)

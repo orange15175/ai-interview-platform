@@ -46,16 +46,15 @@ def decide_followup(
     require_target: bool = True,
     rule_version: str = RULE_VERSION,
 ) -> FollowupDecision:
-    """裁决本轮之后是否追问。
+    """按固定顺序检查跳过、次数、分数和重复方向，决定是否追问；不调用模型。
 
     参数：
         evaluation:     本题评分结果；skipped=True 时为 None
         skipped:        候选人是否跳过了本题
         followup_count: 本主问题已追问的次数（0 起）
         asked_targets:  本主问题此前追问已覆盖的方向（follow_up_target 列表）
-        max_followups:  次数上限（业务默认 2，§1.3）
-        require_target: True 时无 target 的建议一律拒绝（防"为追问而追问"）
-    """
+        max_followups:  次数上限（业务默认 2，
+        require_target: True 时无 target 的建议一律拒绝（防"为追问而追问"）"""
     # 1. 跳过：没有评分就没有依据，不追问
     if skipped or evaluation is None:
         return _stop(REASON_SKIPPED, "候选人跳过本题，无评分依据，不追问")
@@ -90,6 +89,7 @@ def decide_followup(
 
 
 def _stop(reason: str, detail: str) -> FollowupDecision:
+    """统一构造停止追问的结果，附上原因码和当前规则版本。"""
     log.info("追问规则链停止：%s - %s", reason, detail)
     return FollowupDecision(
         decision="stop",

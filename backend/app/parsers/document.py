@@ -1,4 +1,4 @@
-"""文档提取：DOCX / PDF / 图片（开发说明 §4.1 / §五 / §六）。
+"""把上传文件变成文字块和图片块，供解析模型阅读。
 
 四个容易踩的坑，这里都处理了：
 1. DOCX 的段落和表格要按文档真实顺序读，不能先读所有段落再读所有表格。
@@ -8,8 +8,9 @@
    混合 PDF（前几页文字、后几页扫描）不允许"只检查第一页"。
 4. 手机拍的照片方向可能记录在 EXIF 里，不旋转就会横着送给模型。
 
-ZIP 是攻击面：条目数、单条解压大小、总解压大小、压缩比、路径穿越都要卡死，
-否则一个 10 MiB 的 docx 能解压出几个 GB（解压炸弹）把进程打死。
+当前 ZIP 大小、压缩比等限制只覆盖 _docx_image_blocks 读取的内嵌图片。
+extract_docx 会先交给 python-docx 打开正文，尚未对整个 ZIP 做统一解压检查；
+不能把图片处理里的限制理解为整个 DOCX 已受到解压炸弹保护。
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import zipfile
 from PIL import Image, ImageOps
 
 from app.core.config import BusinessDefaults
+from app.core.logging import get_logger
 from app.parsers.types import RenderBlock, TextBlock
 
 # PDF 页面文字少于这个字符数，判定为扫描页/图片页，转为渲染图片
@@ -36,16 +38,58 @@ DOCX_MAX_TOTAL_BYTES = 40 * 1024 * 1024       # 全部解压后总量上限
 DOCX_MAX_COMPRESSION_RATIO = 200              # 单条压缩比上限
 DOCX_MAX_IMAGES = 8                           # 最多解析多少张内嵌图片（控 token）
 _IMAGE_EXT = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp")
+log = get_logger(__name__)
+
+
+def _docx_text(element) -> tuple[str, int]:
+    """按 XML 锚点顺序读取正文和文本框；兼容分支只读一次，不按文字去重。"""
+    from docx.oxml.ns import qn
+
+    mc = "{http://schemas.openxmlformats.org/markup-compatibility/2006}"
+    textbox_count = 0
+
+    def read(node) -> str:
+        nonlocal textbox_count
+        if node.tag == mc + "AlternateContent":
+            # 只处理文本，不渲染形状：优先读取含文本框的 Choice，否则使用 fallback。
+            choices = node.findall(mc + "Choice")
+            selected = next(
+                (c for c in choices if any(True for _ in c.iter(qn("w:txbxContent")))),
+                None,
+            )
+            if selected is None:
+                selected = node.find(mc + "Fallback")
+            if selected is None and choices:
+                selected = choices[0]
+            return read(selected) if selected is not None else ""
+        if node.tag in (qn("w:del"), qn("w:moveFrom")):
+            return ""
+        if node.tag == qn("w:t"):
+            return node.text or ""
+        if node.tag == qn("w:tab"):
+            return "\t"
+        if node.tag in (qn("w:br"), qn("w:cr")):
+            return "\n"
+        if node.tag == qn("w:txbxContent"):
+            textbox_count += 1
+        children = [read(child) for child in node]
+        if node.tag == qn("w:tr"):
+            return " | ".join(text.strip() for text in children if text.strip()) + "\n"
+        text = "".join(children)
+        if node.tag in (qn("w:p"), qn("w:tbl"), qn("w:txbxContent")):
+            return text.rstrip() + "\n" if text.strip() else ""
+        return text
+
+    return read(element).strip(), textbox_count
 
 
 def _docx_image_blocks(
     data: bytes, source: str, label: str, limits: BusinessDefaults
 ) -> tuple[list[RenderBlock], list[str]]:
-    """从 DOCX 的 word/media/ 取图片，校验后转成可送视觉模型的字节。
+    """挑出 DOCX 内嵌图片，限制数量、大小和压缩比后转成模型可读的图片块。
 
     安全顺序是有意为之：先看 inflate 后的大小（infolist 里已记录），
-    确认没超限才真正 read()。反过来"先读再检查"就等于自己给自己造炸弹。
-    """
+    确认没超限才真正 read()。反过来"先读再检查"就等于自己给自己造炸弹。"""
     blocks: list[RenderBlock] = []
     warnings: list[str] = []
     total = 0
@@ -122,41 +166,22 @@ def _docx_image_blocks(
 def extract_docx(
     data: bytes, source: str, label: str, limits: BusinessDefaults | None = None
 ) -> tuple[list[TextBlock], list[RenderBlock], list[str]]:
-    """按文档流顺序抽取段落与表格，并把内嵌图片抽成渲染块。"""
+    """读取正文、表格和浮动文本框，再另行处理内嵌图片。"""
     import docx
-    from docx.oxml.ns import qn
-    from docx.table import Table
-    from docx.text.paragraph import Paragraph
 
     limits = limits or BusinessDefaults()
     warnings: list[str] = []
     document = docx.Document(io.BytesIO(data))
-    lines: list[str] = []
-
-    # 按 body 子元素的真实顺序遍历（w:p 段落 / w:tbl 表格）
-    for child in document.element.body.iterchildren():
-        if child.tag == qn("w:p"):
-            text = Paragraph(child, document).text.strip()
-            if text:
-                lines.append(text)
-        elif child.tag == qn("w:tbl"):
-            table = Table(child, document)
-            for row in table.rows:
-                cells = [c.text.strip().replace("\n", " ") for c in row.cells]
-                # 合并单元格会重复输出同一文本，去掉相邻重复
-                deduped: list[str] = []
-                for c in cells:
-                    if not deduped or deduped[-1] != c:
-                        deduped.append(c)
-                row_text = " | ".join(c for c in deduped if c)
-                if row_text:
-                    lines.append(row_text)
+    text, textbox_count = _docx_text(document.element.body)
 
     # 内嵌图片：文字版简历里贴的设计稿/扫描页，必须交给视觉模型
     images, image_warnings = _docx_image_blocks(data, source, label, limits)
     warnings.extend(image_warnings)
 
-    text = "\n".join(lines)
+    log.info(
+        "DOCX 提取统计: source=%s chars=%d textboxes=%d images=%d",
+        source, len(text), textbox_count, len(images),
+    )
     if not text.strip():
         if images:
             # 整篇都是图片的 DOCX：不算不可读，让视觉模型来读
@@ -168,7 +193,7 @@ def extract_docx(
 
 
 def extract_pdf(data: bytes, source: str, label: str, limits: BusinessDefaults) -> tuple[list[TextBlock], list[RenderBlock], list[str]]:
-    """逐页判断：有文字提文字，没文字渲染成图片。"""
+    """逐页提取 PDF；文字太少的页渲染成图片，便于视觉模型识别扫描件。"""
     import pymupdf as fitz
 
     warnings: list[str] = []
@@ -199,7 +224,7 @@ def extract_pdf(data: bytes, source: str, label: str, limits: BusinessDefaults) 
 
 
 def normalize_image(data: bytes, source: str, label: str) -> tuple[list[RenderBlock], list[str]]:
-    """校正方向、限制尺寸，输出可直接送模型的 JPEG/PNG 字节。"""
+    """按 EXIF 校正方向、处理背景并缩小大图，输出统一的 JPEG 图片块。"""
     warnings: list[str] = []
     with Image.open(io.BytesIO(data)) as img:
         img = ImageOps.exif_transpose(img)  # 手机照片方向校正

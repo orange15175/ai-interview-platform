@@ -1,4 +1,8 @@
-"""解析流水线：文件字节 → 统一 ParsedInput（文字块 + 图片块 + 警告）。
+"""上传材料的统一入口。
+
+validate_jd_text 校验粘贴的 JD；build_parsed_input 把简历和 JD 变成统一的
+ParsedInput；_extract 按扩展名调用 PDF/DOCX/图片解析器；_cap_text 防止过长文本
+推高模型上下文和费用；describe_input 生成前端可展示的解析统计。
 
 只做"把文件变成可送模型的内容"，不做语义理解——理解是 agents/parse_agent 的事。
 """
@@ -19,12 +23,11 @@ MAX_TEXT_CHARS = 60_000
 
 
 def validate_jd_text(jd_text: str | None) -> str | None:
-    """JD 文字的入参校验，**必须在返回 202 之前调用**。
+    """把空白 JD 当作未提供；非空则检查最小长度，返回清理后的文本。
 
     以前这段校验藏在后台准备任务里：接口先回 202，用户等半分钟才看到
     "JD 文本太短"，而且整场面试就此失败。校验本身是纯字符串判断，
-    没有任何理由放到后台。
-    """
+    没有任何理由放到后台。"""
     if jd_text is None:
         return None
     clean = jd_text.strip()
@@ -40,6 +43,7 @@ def validate_jd_text(jd_text: str | None) -> str | None:
 
 
 def _extract(filename: str, data: bytes, source: str, limits: BusinessDefaults) -> ParsedInput:
+    """先检查文件，再按 DOCX、PDF 或图片调用解析器，统一返回文字块和图片块。"""
     info = validate_upload(filename, data, limits)
     label = filename
     if info.kind == "docx":
@@ -61,7 +65,7 @@ def build_parsed_input(
     jd_text: str | None = None,
     limits: BusinessDefaults | None = None,
 ) -> ParsedInput:
-    """组装解析输入。简历必填；JD 支持图片文件或纯文字，二者互斥。"""
+    """合并简历和可选 JD 的提取结果，检查材料非空并限制模型输入文本量。"""
     limits = limits or get_settings().business
 
     if jd_bytes is not None and jd_text and jd_text.strip():
@@ -101,7 +105,7 @@ def build_parsed_input(
 
 
 def _cap_text(parsed: ParsedInput, limit: int = MAX_TEXT_CHARS) -> None:
-    """把文字总量压到上限内（按块截断，保留来源标签）。"""
+    """按来源块顺序截断总文字量，保留来源标签并写入截断警告。"""
     total = parsed.char_count()
     if total <= limit:
         return
@@ -131,7 +135,7 @@ def _cap_text(parsed: ParsedInput, limit: int = MAX_TEXT_CHARS) -> None:
 
 
 def describe_input(parsed: ParsedInput) -> dict:
-    """给日志/状态接口的输入画像（不含内容本身）。"""
+    """统计文字块、图片块和字符数，给进度页使用，不输出简历正文。"""
     pages = {b.page for b in parsed.text_blocks if b.page} | {
         b.page for b in parsed.render_blocks if b.page
     }

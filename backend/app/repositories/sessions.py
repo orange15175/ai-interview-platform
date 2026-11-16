@@ -35,6 +35,7 @@ _UNSET = object()
 
 
 def _as_utc(dt: datetime | None) -> datetime | None:
+    """给无时区时间补上 UTC，便于统一计算会话是否超时。"""
     if dt is None:
         return None
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
@@ -47,11 +48,7 @@ def create(
     question_count: int | None = None,
     user_id: uuid.UUID | None = None,
 ) -> InterviewSession:
-    """创建会话（状态 PREPARING，等解析/出题完成才置 READY）。
-
-    user_id 只在"创建时已登录"的情况下写入：这样换浏览器重新登录还能找回
-    这场面试；匿名创建仍是 None，与旧行为完全一致。
-    """
+    """创建 PREPARING 会话并绑定访客和可选账号，题目准备好后才进入 IN_PROGRESS。"""
     count = question_count if question_count is not None else get_settings().business.question_count
     session = InterviewSession(
         id=uuid.uuid4(),
@@ -68,6 +65,7 @@ def create(
 
 
 def get(db: OrmSession, session_id: uuid.UUID | str) -> InterviewSession | None:
+    """按会话 ID 读取记录，不检查归属；只给已经确定权限的内部流程使用。"""
     return db.get(InterviewSession, _as_uuid(session_id))
 
 
@@ -78,28 +76,11 @@ def get_owned(
     *,
     user_id: uuid.UUID | str | None = None,
 ) -> InterviewSession:
-    """按归属读取；不存在与无权限合并成同一个 404，不泄露"ID 存在"。
+    """把会话 ID 和身份条件一起查 SQL，不存在与不属于当前身份统一返回 404。
 
-    身份**二选一，绝不同时成立**：
-    - 已登录（user_id 非空）→ 只认 user_id：这场面试属于我这个账号吗？
-    - 匿名（user_id 为空）→ 只认 owner_id **且该会话没被账号认领**
-      （user_id IS NULL）：访客只能碰"还没有主人的"会话。
-
-    为什么不能"任一满足即可"（or_）：owner_id 是浏览器粒度、user_id 是账号粒度，
-    两者不同权。同一个浏览器上 A 登出、B 登录时访客 Cookie **不变**，若取或，
-    B 就能顺着 owner_id 读到 A 的全部面试（题干、简历要点、作答原文全在里面）；
-    反过来，A 只是退出登录后，匿名的 owner_id 也能读到 A 已绑账号的会话。
-    所以两边都收紧：登录态忽略 owner_id，匿名态排除已认领的会话。
-
-    判定写在 SQL 的 where 里，查不到直接抛错——绝不"先查出来再 if"。
-    """
-    if user_id is not None:
-        identity = InterviewSession.user_id == _as_uuid(user_id)
-    else:
-        identity = and_(
-            InterviewSession.owner_id == _as_uuid(owner_id),
-            InterviewSession.user_id.is_(None),
-        )
+    身份**二选一，绝不同时成立**（判定见 _identity_clause）。
+    查不到直接抛错——绝不"先查出来再 if"。"""
+    identity = _identity_clause(owner_id, user_id)
     stmt = select(InterviewSession).where(
         InterviewSession.id == _as_uuid(session_id),
     ).where(identity)
@@ -109,7 +90,56 @@ def get_owned(
     return session
 
 
+def _identity_clause(
+    owner_id: uuid.UUID | str,
+    user_id: uuid.UUID | str | None,
+) -> Any:
+    """生成"这条会话归谁"的 where 条件，get_owned 与 list_owned 共用一份。
+
+    必须是同一个函数而不是两处照抄：这条条件一旦有分叉，就会变成越权读取。
+
+    - 已登录（user_id 非空）→ 只认 user_id：这场面试属于我这个账号吗？
+    - 匿名（user_id 为空）→ 只认 owner_id **且该会话没被账号认领**
+      （user_id IS NULL）：访客只能碰"还没有主人的"会话。
+
+    为什么不能"任一满足即可"（or_）：owner_id 是浏览器粒度、user_id 是账号粒度，
+    两者不同权。同一个浏览器上 A 登出、B 登录时访客 Cookie **不变**，若取或，
+    B 就能顺着 owner_id 读到 A 的全部面试（题干、简历要点、作答原文全在里面）；
+    反过来，A 只是退出登录后，匿名的 owner_id 也能读到 A 已绑账号的会话。
+    """
+    if user_id is not None:
+        return InterviewSession.user_id == _as_uuid(user_id)
+    return and_(
+        InterviewSession.owner_id == _as_uuid(owner_id),
+        InterviewSession.user_id.is_(None),
+    )
+
+
+def list_owned(
+    db: OrmSession,
+    owner_id: uuid.UUID | str,
+    *,
+    user_id: uuid.UUID | str | None = None,
+    limit: int = 20,
+    offset: int = 0,
+) -> list[InterviewSession]:
+    """按当前身份取最近的会话列表（列表页用），按最近活动时间倒序。
+
+    身份条件与 get_owned 完全一致；order by 用 last_activity_at 而不是
+    created_at：一场很久以前创建、今天才答完的面试应该排在最前面。
+    """
+    stmt = (
+        select(InterviewSession)
+        .where(_identity_clause(owner_id, user_id))
+        .order_by(InterviewSession.last_activity_at.desc(), InterviewSession.id.desc())
+        .limit(max(1, min(limit, 100)))
+        .offset(max(0, offset))
+    )
+    return list(db.scalars(stmt).all())
+
+
 def _as_uuid(value: uuid.UUID | str) -> uuid.UUID:
+    """统一会话 ID 类型，非法 UUID 也按会话不存在返回，避免泄露解析细节。"""
     if isinstance(value, uuid.UUID):
         return value
     try:
@@ -120,23 +150,23 @@ def _as_uuid(value: uuid.UUID | str) -> uuid.UUID:
 
 
 def assert_can_answer(session: InterviewSession) -> None:
-    """终态检查（§7.2 规则链第 0 条：终态直接拒绝，不进入评分）。"""
+    """拒绝终态或超时会话；这里设置过期状态后直接抛错，尚未独立提交过期状态。"""
     if session.status in TERMINAL_STATUSES:
         raise SessionFinishedError()
     expires = _as_utc(session.last_activity_at)
     ttl = timedelta(hours=get_settings().business.session_ttl_hours)
     if expires is not None and expires + ttl < datetime.now(timezone.utc):
+        # 当前这里仅改 ORM 对象后抛错；请求结束的回滚会撤销 EXPIRED，尚未持久化。
         session.status = "EXPIRED"
         raise SessionFinishedError("会话长时间无活动已过期，请重新创建面试")
 
 
 def lock_row(db: OrmSession, session: InterviewSession) -> InterviewSession:
-    """行级锁（PostgreSQL）。
+    """PostgreSQL 中锁住会话行并刷新对象，避免两个事务同时读改写。
 
     这是会话锁之外的**第二道**保护：多 worker 同时通过 Redis 锁的极端情况下
     （如租约刚过期），数据库行锁让两个请求排队，再由 state_version 拒绝旧写入。
-    SQLite 不支持 FOR UPDATE，测试环境直接跳过（它的写本来就串行）。
-    """
+    SQLite 不支持 FOR UPDATE，测试环境直接跳过（它的写本来就串行）。"""
     if db.bind is not None and db.bind.dialect.name == "postgresql":
         db.execute(
             select(InterviewSession.id)
@@ -159,7 +189,7 @@ def touch(
     started: bool = False,
     finished: bool = False,
 ) -> InterviewSession:
-    """更新会话的展示投影与进度（不负责版本号，版本只走 bump_state_version）。"""
+    """修改会话状态、当前题和进度，同时刷新活动时间；不会自行提交或推进版本。"""
     if status is not None:
         session.status = status
     if current_question_id is not _UNSET:
@@ -180,6 +210,7 @@ def touch(
 
 
 def _is_postgres(db: OrmSession) -> bool:
+    """判断当前会话绑定的数据库是否为 PostgreSQL，决定是否使用行锁。"""
     return db.bind is not None and db.bind.dialect.name == "postgresql"
 
 
@@ -196,19 +227,19 @@ class WriteFence:
     state_version: int
 
     def covers(self, session: InterviewSession) -> bool:
+        """只比较对象中的写入代次是否一致；数据库是否仍允许写入由后续条件更新决定。"""
         return session.write_epoch == self.epoch
 
 
 def begin_write(db: OrmSession, session: InterviewSession) -> WriteFence:
-    """取得写入资格：行锁内递增 write_epoch，读出 state_version，**立刻提交**。
+    """增加 write_epoch 并立即提交，发放本次写入资格，同时取得当前业务版本。
 
     为什么必须马上提交：模型调用动辄几十秒，把数据库行锁带进模型调用等于
     让整场面试排队等一个外部 HTTP 请求。这里只做一次极短的读改写，
     真正的写入保护靠后面带条件的 UPDATE（见 bump_state_version 的 fence 参数）。
 
     也正因为它短，"锁已拿到但 epoch 没来得及递增"的窗口极小；即便撞上，
-    条件更新也会让其中一方影响 0 行，不会两份结果都落库。
-    """
+    条件更新也会让其中一方影响 0 行，不会两份结果都落库。"""
     if _is_postgres(db):
         # 先拿行锁再读改写，避免两个接管者同时读到同一个 epoch 各自 +1
         db.execute(
@@ -230,11 +261,10 @@ def begin_write(db: OrmSession, session: InterviewSession) -> WriteFence:
 
 
 def check_fence(session: InterviewSession, fence: WriteFence | None) -> None:
-    """写入前的快速自检（真正的闸仍是数据库条件更新）。
+    """先用内存对象检查代次是否已知失效，最终仍需数据库条件更新兜底。
 
     这里拦的是"我自己都知道已经丢了"的情况：早点报错，别等跑完模型、
-    写完半张表再回滚。
-    """
+    写完半张表再回滚。"""
     if fence is not None and not fence.covers(session):
         raise WriteFenceLostError()
 
@@ -246,7 +276,7 @@ def bump_state_version(
     expected: int | None = None,
     fence: WriteFence | None = None,
 ) -> int:
-    """CAS 递增版本号：`UPDATE ... WHERE state_version = expected [AND write_epoch = epoch]`。
+    """只有数据库版本和可选写入代次匹配时才递增版本，否则拒绝本次写入。
 
     返回新版本号；rowcount 为 0 → 拒绝写入并回滚（区分是丢了写入资格还是
     状态被别人推进，见 _reject_write）。
@@ -254,8 +284,7 @@ def bump_state_version(
 
     fence 非空时同时校验 write_epoch —— 两道条件缺一不可：
     只比 state_version，两个请求都读到 v=1 时会各自写 v=2，后者覆盖前者；
-    只比 write_epoch，同一持有者内部的重复推进（重放）拦不住。
-    """
+    只比 write_epoch，同一持有者内部的重复推进（重放）拦不住。"""
     current = session.state_version if expected is None else expected
     new_version = current + 1
     conditions = [
@@ -280,12 +309,11 @@ def bump_state_version(
 def _reject_write(
     db: OrmSession, session: InterviewSession, fence: WriteFence | None
 ) -> None:
-    """条件更新影响 0 行：判定是哪一层拦的，然后抛错。
+    """回查更新失败原因，区分写入资格丢失和业务版本冲突，交调用方回滚。
 
     这里**不**自己 rollback：回滚责任在调用方（它才知道这条事务里还有哪些
     写入该一起丢掉）。这里只做一次只读回查——条件更新已经拿到行锁，
-    读到的就是当前已提交的值，拿它区分"丢了写入资格"和"状态被别人推进"。
-    """
+    读到的就是当前已提交的值，拿它区分"丢了写入资格"和"状态被别人推进"。"""
     row = db.execute(
         select(InterviewSession.write_epoch, InterviewSession.state_version)
         .where(InterviewSession.id == session.id)
@@ -303,11 +331,10 @@ def mark_preparation_failed(
     stage: str | None = None,
     error_code: str | None = None,
 ) -> None:
-    """解析/出题失败：终态 + 脱敏错误码，允许用户重新创建（不覆盖旧记录）。
+    """把准备失败的阶段、错误和结束状态写进会话，供前端提示和判断能否重试。
 
     stage / error_code 写进 progress：用户重试时后端要能判断"材料到底存下来了
-    没有"——存在解析结果就只重跑出题，不存在才要求重新上传（§十）。
-    """
+    没有"——存在解析结果就只重跑出题，不存在才要求重新上传（§十）。"""
     progress: dict[str, Any] = {
         "stage": "PREPARATION_FAILED",
         "sanitized_error": message[:300],

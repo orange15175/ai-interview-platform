@@ -41,7 +41,7 @@ _BUSY_BACKOFF_SECONDS = 30
 
 
 def _acquire_lock(session_id) -> "locks.SessionLock | None":
-    """拿会话锁；拿不到返回 None（不抛错，交给调用方决定延后）。"""
+    """尝试取得会话锁，暂时拿不到就返回 None，交给补偿任务延后处理。"""
     try:
         return locks.acquire(str(session_id), wait_ms=0)
     except SessionBusyError:
@@ -49,11 +49,10 @@ def _acquire_lock(session_id) -> "locks.SessionLock | None":
 
 
 def _defer(db: OrmSession, answer: InterviewAnswer, now: datetime | None = None) -> None:
-    """抢不到会话锁：把任务原样放回队列，只把到期时间往后挪。
+    """拿不到会话锁时撤回抢占并延后执行，避免一直争抢。
 
     必须把 processing_status 从 PROCESSING 还原成 FAILED——抢占是条件更新，
-    不改回来这行就永远不再被扫描（状态不是 FAILED），一次锁竞争等于吞掉一次重试。
-    """
+    不改回来这行就永远不再被扫描（状态不是 FAILED），一次锁竞争等于吞掉一次重试。"""
     answer.processing_status = "FAILED"
     answer.next_retry_at = (now or datetime.now(timezone.utc)) + timedelta(
         seconds=_BUSY_BACKOFF_SECONDS
@@ -64,11 +63,10 @@ def _defer(db: OrmSession, answer: InterviewAnswer, now: datetime | None = None)
 
 
 def _return_to_queue(db: OrmSession, answer_id: uuid.UUID, now: datetime | None) -> None:
-    """未预期异常后把抢占还原：状态回到 FAILED，到期时间延后一轮。
+    """发生未预期异常时释放抢占，把回答重新放回失败队列等待下一轮。
 
     只做"还原"，不写错误码：这种情况下失败原因可能是进程级问题
-    （数据库瞬断等），记成业务错误码会误导复盘。
-    """
+    （数据库瞬断等），记成业务错误码会误导复盘。"""
     fresh = answers_repo.get(db, answer_id)
     if fresh is None or fresh.processing_status != "PROCESSING":
         return
@@ -93,11 +91,10 @@ def process_claimed(
     lock_factory: Callable = _acquire_lock,
     now: datetime | None = None,
 ) -> str:
-    """处理一条已抢占的失败提交，返回结果标签（便于统计与断言）。
+    """处理已抢占的失败回答：核对会话和题目，再用原始输入续跑答题流程。
 
     返回：completed / retried_failed / skipped（会话结束、题不匹配等）/
-          busy（没抢到会话锁，已延后）
-    """
+          busy（没抢到会话锁，已延后）"""
     answer = answers_repo.get(db, answer_id)
     if answer is None:
         return "skipped"
@@ -171,7 +168,7 @@ def run_once(
     redis_client=None,
     lock_factory: Callable = _acquire_lock,
 ) -> dict:
-    """扫一轮并处理，返回统计。供 CLI 与测试共用（测试里 db_factory 指向内存库）。"""
+    """扫描一批到期失败回答，逐条原子抢占并处理，返回本轮统计。"""
     graph = graph or graph_runtime.get_compiled_graph()
     limit = limit or 5
     now = now or datetime.now(timezone.utc)
@@ -216,7 +213,7 @@ def run_once(
 
 
 def worker_interval_seconds() -> int:
-    """扫描间隔（默认 15 秒）。太密只是空转，太疏会让"30 秒后重试"名不副实。"""
+    """读取并限制后台扫描间隔，避免配置过小导致频繁空转。"""
     raw = (get_settings().retry_worker_interval_seconds or 15)
     return max(int(raw), 1)
 

@@ -7,15 +7,17 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from app.agents.adapters import MockTextAdapter
 from app.agents.evaluate_agent import evaluate_answer
 from app.agents.followup_agent import generate_followup
 from app.core.errors import ModelCallError, ModelOutputInvalidError
-from app.schemas.evaluation import Evaluation, FollowUpQuestion
+from app.schemas.evaluation import Evaluation, FollowUpQuestion, GeneratedFollowUpQuestion
 
-# 与 mock 评分 rubric_results（1 条）不同长度 → 触发"要点齐全才校验"的分支
+# 当前题的两条评分依据，模型必须按顺序逐条评价。
 _QUESTION = {
     "main_index": 1,
     "kind": "main",
@@ -53,8 +55,19 @@ def test_evaluate_with_mock_adapter_overrides_score_by_code():
     assert ev.follow_up_suggested is True
 
 
+def _valid_evaluation():
+    return {
+        "score": 60, "feedback": "核心正确，需补充结果的测量方法。",
+        "dimension_scores": dict.fromkeys(["correctness", "completeness", "logic", "depth", "clarity"], 60),
+        "rubric_results": [{"point": p["point"], "met": "yes", "note": "回答覆盖该点"}
+                           for p in _QUESTION["evaluation_rubric"]],
+        "missing_points": [], "follow_up_suggested": False,
+        "follow_up_reason": "", "follow_up_target": "",
+    }
+
+
 def test_evaluate_invalid_then_valid_repair_once():
-    bad = _FixedAdapter(["这不是 JSON", "{\"score\": 60, \"feedback\": \"ok\"}"])
+    bad = _FixedAdapter(["这不是 JSON", json.dumps(_valid_evaluation())])
     ev = evaluate_answer(_QUESTION, "回答", adapter=bad)
     assert ev.score == 60
     assert bad.calls == 2  # 第一次失败，修复一次成功
@@ -66,26 +79,32 @@ def test_evaluate_all_invalid_raises_retryable_error():
         evaluate_answer(_QUESTION, "回答", adapter=bad)
 
 
-def test_evaluate_rubric_inconsistency_normalizes_score():
-    """要点全 yes 期望 100 分，模型两次都给 40：修复无效 → 信要点、修总分。
-
-    真实模型实测（DeepSeek）：要点判定严格可靠、总分常常虚高，所以
-    持续背离时用要点期望分归一化（score_source=code + feedback 说明），
-    绝不让评分环节卡死整场面试，也绝不静默采用虚高的总分。
-    """
-    inconsistent = (
-        '{"score": 40, "feedback": "回答完整", '
-        '"rubric_results": ['
-        '{"point": "讲清背景与权衡", "met": "yes", "note": ""},'
-        '{"point": "有量化结果", "met": "yes", "note": ""}],'
-        '"follow_up_suggested": false}'
-    )
-    stubborn = _FixedAdapter([inconsistent, inconsistent])
-    ev = evaluate_answer(_QUESTION, "回答", adapter=stubborn)
-    assert stubborn.calls == 2  # 修复过一次
-    assert ev.score == 100      # 以要点期望分为准
+def test_rubric_coverage_never_overrides_dimension_score():
+    # 全部要点 yes 不代表五维一定100分，唯一总分依据仍是五维。
+    adapter = _FixedAdapter([json.dumps(_valid_evaluation())])
+    ev = evaluate_answer(_QUESTION, "回答", adapter=adapter)
+    assert ev.score == 60
     assert ev.score_source == "code"
-    assert "归一化" in ev.feedback
+    assert ev.prompt_version == "v2"
+    assert adapter.calls == 1
+
+
+@pytest.mark.parametrize("change", [
+    {"dimension_scores": None},
+    {"dimension_scores": {"correctness": 60}},
+    {"rubric_results": []},
+    {"score": "60"},
+    {"score": True},
+    {"follow_up_suggested": "false"},
+    {"missing_points": ["  "]},
+    {"follow_up_suggested": True, "follow_up_target": ""},
+])
+def test_invalid_scoring_contract_is_rejected(change):
+    payload = {**_valid_evaluation(), **change}
+    adapter = _FixedAdapter([json.dumps(payload)] * 2)
+    with pytest.raises(ModelOutputInvalidError):
+        evaluate_answer(_QUESTION, "回答", adapter=adapter)
+
 
 
 def test_evaluate_model_call_failure_raises_retryable():
@@ -111,10 +130,35 @@ def test_followup_duplicate_rejected_then_error():
     # 模型连续两次都输出与已问清单重复的问题 → 修复后仍重复 → 抛错
     asked = "你提到该系统，当时是怎么测试 QPS 和 P99 延迟的？"
     dup = _FixedAdapter(
-        ['{"content": "你提到该系统，当时是怎么测试 QPS 和 P99 延迟的？"}'] * 2
+        [json.dumps({"content": asked, "evaluation_rubric": [{"point": "指标测量方法", "weight": 1.0}]})] * 2
     )
     with pytest.raises(ModelOutputInvalidError):
         generate_followup(_QUESTION, "回答", ev,
                           asked_contents=[asked],
                           adapter=dup)
     assert dup.calls == 2
+
+
+def test_followup_missing_independent_rubric_is_rejected():
+    ev = Evaluation(score=70, feedback="需说明测量", follow_up_target="性能指标")
+    adapter = _FixedAdapter(['{"content":"当时是怎么测量P99延迟的？"}'] * 2)
+    with pytest.raises(ModelOutputInvalidError):
+        generate_followup(_QUESTION, "回答", ev, [], adapter=adapter)
+
+
+def test_context_and_answer_tail_reach_followup_model():
+    from app.agents.followup_agent import _build_user_prompt
+    ev = Evaluation(score=70, feedback="需说明测量", follow_up_target="性能指标")
+    question = {**_QUESTION, "main_question": "主问题原文", "history": [
+        {"question": "之前问句", "answer": "之前的有效回答"}]}
+    prompt = _build_user_prompt(question, "字" * 2100 + "关键尾部", ev, [])
+    assert "关键尾部" in prompt and "之前的有效回答" in prompt and "主问题原文" in prompt
+
+
+def test_new_followup_cannot_hide_multiple_questions_by_normalizing_punctuation():
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError, match="一个问号"):
+        GeneratedFollowUpQuestion.model_validate({
+            "content": "你有没有做压测？当时如何统计延迟？",
+            "evaluation_rubric": [{"point": "延迟统计方法", "weight": 1.0}],
+        })

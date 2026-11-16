@@ -24,7 +24,7 @@ _saver: BaseCheckpointSaver | None = None
 
 
 def get_checkpointer() -> BaseCheckpointSaver:
-    """惰性单例：整个进程共用同一个 RedisSaver（含已建好的索引与 registry）。"""
+    """首次使用时创建 Redis 检查点存储并建立索引，后续复用同一实例。"""
     global _saver
     if _saver is None:
         client = get_redis()
@@ -37,6 +37,6 @@ def get_checkpointer() -> BaseCheckpointSaver:
 
 
 def reset_checkpointer_cache() -> None:
-    """测试/运维用：丢弃单例（下次调用重新 setup）。"""
+    """清掉检查点存储实例，下次调用重新连接和初始化，主要供测试使用。"""
     global _saver
     _saver = None

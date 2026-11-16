@@ -24,12 +24,11 @@ class ModelOutputError(ValueError):
 
 
 def parse_json_object(text: str) -> dict[str, Any]:
-    """从模型文本中提取 JSON 对象，并在结构不合法时抛出明确错误。
+    """从模型回复中提取 JSON 对象，无法解析或根类型错误时给出明确异常。
 
     为什么要正则而不是直接 json.loads？
         因为模型即使被要求"只输出 JSON"，仍可能加 ```json 包裹，
-        或前面来一句"好的，以下是评分："。所以先抠出第一个 {...} 再解析。
-    """
+        或前面来一句"好的，以下是评分："。所以先抠出第一个 {...} 再解析。"""
     match = re.search(r"\{.*\}", text, re.DOTALL)  # DOTALL 让 . 匹配换行
     if not match:
         raise ModelOutputError("模型没有返回 JSON 对象")
@@ -48,14 +47,13 @@ def parse_json_object(text: str) -> dict[str, Any]:
 
 
 def clamp_score(value: Any) -> int:
-    """将模型分数转换为 0 到 100 的整数，防止非法分数污染报告。
+    """把可转换分数整理成 0～100 的整数，限制异常数值范围。
 
     三种异常输入都会被拦下：
         "85分"  -> int() 抛 ValueError
         None    -> int() 抛 TypeError
         {}      -> int() 抛 TypeError
-    转换为 0 静默处理是不行的——报告里一个假 0 分比报错更糟。
-    """
+    转换为 0 静默处理是不行的——报告里一个假 0 分比报错更糟。"""
     try:
         return max(0, min(100, int(value)))
     except (TypeError, ValueError) as exc:

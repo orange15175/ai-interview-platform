@@ -128,6 +128,16 @@ def test_recover_stops_at_followup_and_keeps_history(env):
     assert waiting is True and next_nodes == ("wait_answer",)
     assert len(values["evaluations"]) == 1  # 历史评分从数据库重建
     assert values["current_followup_index"] == 1  # 追问次数不清零（否则会超过上限）
+    assert values["answer_history"] == [{
+        "question": env.started["question"]["content"],
+        "answer": "我做了取舍，并给出了量化结果。",
+    }]
+    assert values["pending_question"]["evaluation_rubric"] == [
+        {"point": "说明P99延迟的测量方法", "weight": 1.0}]
+    assert values["pending_question"]["evaluation_rubric"] != values["questions"][0]["evaluation_rubric"]
+    row = answers_repo.list_for_session(env.db, env.session.id)[0]
+    assert row.prompt_version == "v2"
+
 
     # 继续答题：用同一个 request 之外的正常提交，历史不丢
     res = _submit(env, graph2, result["question"]["question_id"])

@@ -4,11 +4,11 @@
 1. 明文 token 只存在于浏览器的 HttpOnly Cookie 里，数据库只存 SHA-256 哈希。
    拖库者拿到哈希也无法伪造 Cookie（SHA-256 单向；token 本身是 32 字节随机，
    不需要加盐也不能用快速哈希以外的方案——它本来就是高熵随机串，不是密码）。
-2. token 必须不可预测（secrets，不是 uuid4 的字符串化——uuid4 只有 122 位且
-   习惯上会暴露时间/机器信息，随机串更干净）。
-3. Cookie 属性：HttpOnly（JS 读不到，防 XSS 偷身份）、SameSite=Lax（跨站写请求
+2. token 用 secrets 生成高随机性字符串；不要把公开的会话 UUID 当作身份凭证。
+3. Cookie 属性：HttpOnly（JS 不能直接读取 Cookie，但不能单独防住 XSS）、SameSite=Lax（跨站写请求
    不带 Cookie，配合 Origin 校验防 CSRF）、生产 HTTPS 下 Secure。
-4. 清理 Cookie = 丢失身份。系统不提供"按手机号找回"，也不提供全局记录列表
+4. 清理匿名 Cookie 会丢失匿名身份；已绑定账号的会话仍可用对应账号登录后访问。
+   系统不提供"按手机号找回"，也不提供全局记录列表
    （§11：UUID 不等于访问权限）。
 """
 
@@ -27,29 +27,28 @@ TOKEN_HASH_LEN = 64
 
 
 def new_visitor_token() -> str:
-    """生成一个新的访客明文 token（只在 Set-Cookie 时出现一次）。"""
+    """生成高随机性的匿名凭证，浏览器持有明文，数据库只存其哈希。"""
     return secrets.token_urlsafe(TOKEN_BYTES)
 
 
 def hash_visitor_token(token: str) -> str:
-    """明文 token → 入库用的哈希。入参为空时抛错，避免把空串哈希入库。"""
+    """把匿名凭证转成 SHA-256 哈希，供数据库查询和存储。"""
     if not token:
         raise ValueError("访客 token 为空")
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def token_matches(token: str, token_hash: str) -> bool:
-    """恒定时间比较；用于需要显式核对的场景（正常查询直接用哈希做 where 条件）。"""
+    """对匿名凭证计算哈希后用恒定时间方式比较，避免普通字符串比较的耗时差异。"""
     if not token or not token_hash:
         return False
     return hmac.compare_digest(hash_visitor_token(token), token_hash)
 
 
 def looks_like_token(token: str | None) -> bool:
-    """粗筛客户端传来的 Cookie 值，挡掉明显垃圾（正常 token 43 字符、无空白）。
+    """先检查匿名凭证长度和空白，挡掉明显无效输入；最终身份仍靠查库。
 
-    这不是安全边界（真正的边界是哈希查库），只是别拿它去查库、别写脏数据。
-    """
+    这不是安全边界（真正的边界是哈希查库），只是别拿它去查库、别写脏数据。"""
     if not token or not isinstance(token, str):
         return False
     if not 20 <= len(token) <= 128:
@@ -74,7 +73,7 @@ PASSWORD_MAX_LEN = 128   # 上限不是安全需要，是防止超长输入把 C
 
 
 def hash_password(password: str) -> str:
-    """明文 → `pbkdf2_sha256$迭代次数$盐$哈希`（盐随机、每次不同）。"""
+    """使用随机盐和多轮 PBKDF2 生成密码哈希，数据库不存明文密码。"""
     if not isinstance(password, str) or not password:
         raise ValueError("密码为空")
     if len(password) > PASSWORD_MAX_LEN:
@@ -85,7 +84,7 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(password: str, stored: str) -> bool:
-    """校验密码。任何异常（格式坏、算法不认识）都返回 False，绝不抛错泄信息。"""
+    """解析已存哈希并重算密码摘要，再做恒定时间比较；常见格式错误按不匹配处理。"""
     if not isinstance(password, str) or not password or len(password) > PASSWORD_MAX_LEN:
         return False
     try:
@@ -112,7 +111,7 @@ def verify_password(password: str, stored: str) -> bool:
 
 
 def issue_login_token(user_id: uuid.UUID | str, *, secret: str, ttl_hours: int) -> tuple[str, int]:
-    """签发登录令牌，返回 (令牌, 有效秒数)。"""
+    """把用户 ID 和过期时间签名，返回 Cookie 值及浏览器保存时长。"""
     if not secret:
         raise ValueError("AUTH_SECRET 未配置，无法签发登录令牌")
     expires_at = int(time.time()) + max(1, ttl_hours) * 3600
@@ -122,7 +121,7 @@ def issue_login_token(user_id: uuid.UUID | str, *, secret: str, ttl_hours: int) 
 
 
 def parse_login_token(token: str | None, *, secret: str) -> uuid.UUID | None:
-    """校验令牌并取出 user_id；签名不对/过期/格式坏一律返回 None（当作未登录）。"""
+    """核验令牌签名、过期时间和用户 ID，失败就返回 None，不能自行信任 Cookie。"""
     if not token or not secret or not isinstance(token, str):
         return None
     parts = token.split(".")

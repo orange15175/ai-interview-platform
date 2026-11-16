@@ -117,6 +117,62 @@ def test_docx_extract_preserves_order_and_tables():
     assert "后端开发" in body
 
 
+def test_docx_textboxes_and_compatibility_branches():
+    """现代/旧式文本框均可读；备用结构不重复，真实重复文字不丢失。"""
+    import docx
+    from lxml import etree
+
+    d = docx.Document()
+    d.add_paragraph("正文前")
+    xml = '''<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"
+        xmlns:v="urn:schemas-microsoft-com:vml">
+      <w:r><mc:AlternateContent>
+        <mc:Choice Requires="wps"><wps:wsp><wps:txbx><w:txbxContent>
+          <w:p><w:r><w:t>项目经历</w:t></w:r></w:p>
+          <w:tbl><w:tr><w:tc><w:p><w:r><w:t>项目A</w:t></w:r></w:p></w:tc>
+            <w:tc><w:p><w:r><w:t>Redis</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+        </w:txbxContent></wps:txbx></wps:wsp></mc:Choice>
+        <mc:Fallback><v:shape><v:textbox><w:txbxContent>
+          <w:p><w:r><w:t>项目经历</w:t></w:r></w:p>
+        </w:txbxContent></v:textbox></v:shape></mc:Fallback>
+      </mc:AlternateContent></w:r>
+      <w:r><w:pict><v:shape><v:textbox><w:txbxContent>
+        <w:p><w:r><w:t>教育经历</w:t></w:r></w:p>
+      </w:txbxContent></v:textbox></v:shape></w:pict></w:r>
+    </w:p>'''
+    d.element.body.insert(1, etree.fromstring(xml.encode()))
+    d.add_paragraph("正文后")
+    d.add_paragraph("Redis")
+    buf = io.BytesIO()
+    d.save(buf)
+    texts, _, _ = extract_docx(buf.getvalue(), "resume", "textboxes.docx")
+    text = texts[0].text
+    assert text.count("项目经历") == 1
+    assert text.count("Redis") == 2
+    assert "项目A | Redis" in text
+    assert text.index("正文前") < text.index("项目经历") < text.index("教育经历") < text.index("正文后")
+
+
+def test_docx_textbox_in_table_and_alternate_fallback():
+    import docx
+    from lxml import etree
+
+    d = docx.Document()
+    cell = d.add_table(rows=1, cols=1).cell(0, 0)
+    cell._tc.append(etree.fromstring(b'''<mc:AlternateContent
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+      <mc:Choice Requires="unknown"/>
+      <mc:Fallback><w:txbxContent><w:p><w:r><w:t>fallback project</w:t></w:r></w:p>
+      </w:txbxContent></mc:Fallback></mc:AlternateContent>'''))
+    buf = io.BytesIO()
+    d.save(buf)
+    texts, _, _ = extract_docx(buf.getvalue(), "resume", "table.docx")
+    assert "fallback project" in texts[0].text
+
+
 def test_pdf_mixed_pages_handled_per_page():
     """混合 PDF：第 1 页提文字，第 2 页渲染成图片（不允许只看第一页）。"""
     texts, renders, warnings = extract_pdf(_make_mixed_pdf(), "resume", "简历.pdf", LIMITS)

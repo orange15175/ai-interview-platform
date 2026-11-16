@@ -20,7 +20,7 @@ _session_factory: sessionmaker | None = None
 
 
 def get_engine():
-    """惰性单例引擎。测试里先设置环境变量再首次调用即可指向不同库。"""
+    """第一次使用时创建并复用数据库连接池，取连接前检查连接是否仍有效。"""
     global _engine
     if _engine is None:
         _engine = create_engine(
@@ -35,6 +35,7 @@ def get_engine():
 
 
 def get_session_factory() -> sessionmaker:
+    """创建并缓存数据库会话工厂，各请求从它获得独立会话。"""
     global _session_factory
     if _session_factory is None:
         _session_factory = sessionmaker(bind=get_engine(), expire_on_commit=False, future=True)
@@ -42,11 +43,10 @@ def get_session_factory() -> sessionmaker:
 
 
 def session_scope() -> Iterator[Session]:
-    """带事务语义的会话上下文：正常提交、异常回滚、最终关闭。
+    """提供生成器式事务入口：正常结束提交，异常回滚，最后关闭数据库会话。
 
-    注意（开发说明 §9.2）：不要跨模型调用持有长事务——
-    模型调用的 1~2 分钟里占着连接池是事故源。需要长流程时用多个短事务。
-    """
+    注意（开发说明 ：不要跨模型调用持有长事务——
+    模型调用的 1~2 分钟里占着连接池是事故源。需要长流程时用多个短事务。"""
     session = get_session_factory()()
     try:
         yield session

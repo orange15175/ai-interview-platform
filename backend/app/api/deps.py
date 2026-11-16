@@ -1,17 +1,11 @@
-"""FastAPI 依赖：数据库会话、匿名访客 Cookie、编译好的图（开发说明 §1.1/§11）。
+"""FastAPI 依赖：每个请求都要经过的基础边界。
 
-阶段 4 只落地"身份与并发"这两块基础设施，具体路由在阶段 5 接上。
-放这里的意义：Cookie 的写法（HttpOnly/SameSite/Secure、只在新建时下发）
-必须是**唯一一处**，否则各接口各写一遍，迟早漏掉某个属性。
+get_db 管理数据库会话；get_visitor 维护匿名身份；get_current_user 解析登录
+Cookie；require_same_origin 防 CSRF；get_graph 和 get_redis_client 提供共享基础设施。
+把这些边界集中在依赖层，避免每个路由各写一套而漏掉安全检查。
 
-三个依赖：
-- get_db：每请求一个 Session，异常时关闭（未提交的事务随之回滚）。
-- get_visitor：读 Cookie → 转哈希查库；无效/过期则新建并 Set-Cookie。
-- require_same_origin：写操作的 Origin 校验（CSRF），浏览器跨站请求直接 403。
-
-阶段 5 追加：
-- get_graph：编译好的面试图（进程内缓存，状态在 checkpointer 里）。
-- get_redis_client：幂等缓存用的 Redis 客户端（与 checkpointer 是两个用途）。
+匿名身份和账号身份是两套 Cookie。匿名 Cookie 的最终写出由 main.py 的中间件负责，
+登录 Cookie 的签发由 auth.py 负责。请求 ID 和会话 ID 都不能代替这两种身份凭证。
 """
 
 from __future__ import annotations
@@ -36,10 +30,9 @@ SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
 def get_db() -> Iterator[OrmSession]:
-    """请求级数据库会话。
+    """为当前请求提供数据库会话，请求结束时关闭，未提交的修改会回滚。
 
-    服务层自己调 commit（短事务），这里只负责关闭；异常时未提交的写入被丢弃。
-    """
+    服务层自己调 commit（短事务），这里只负责关闭；异常时未提交的写入被丢弃。"""
     session = get_session_factory()()
     try:
         yield session
@@ -51,7 +44,7 @@ def get_visitor(
     request: Request,
     db: OrmSession = Depends(get_db),
 ) -> AnonymousVisitor:
-    """解析匿名访客；首次访问时登记 HttpOnly Cookie。
+    """用匿名 Cookie 找访客；找不到或已过期就新建，并登记需要下发的 Cookie。
 
     Cookie **不在依赖里直接 set**，而是登记到 request.state，由
     PendingCookieMiddleware（main.py）盖到最终响应上。原因：异常处理器
@@ -59,8 +52,7 @@ def get_visitor(
     请求若恰好失败（404/422），就永远拿不到身份，之后每个请求都变成
     新访客。真实联调时这个 bug 表现为"评分丢失、会话找不回"。
 
-    Cookie 只在"新建/过期"时登记，正常请求不重复 Set-Cookie。
-    """
+    Cookie 只在"新建/过期"时登记，正常请求不重复 Set-Cookie。"""
     settings = get_settings()
     token = request.cookies.get(settings.visitor_cookie_name)
     visitor, new_token = visitors_repo.get_or_create(db, token)
@@ -84,14 +76,13 @@ def get_visitor(
 
 
 def require_same_origin(request: Request) -> None:
-    """写操作来源校验（同源代理部署下，Origin 的 host 必须与服务端一致）。
+    """写请求带 Origin 时检查其主机和端口；来源不允许就拒绝，没有 Origin 则放行。
 
     判定口径：
     - 安全方法（GET/HEAD/OPTIONS）不校验；
     - 带 Origin 且 host 不一致 → 403；
     - 不带 Origin（curl、服务间调用）→ 放行：浏览器在跨站写请求上**一定会**
-      带 Origin，缺省它意味着不是浏览器发起的 CSRF。
-    """
+      带 Origin，缺省它意味着不是浏览器发起的 CSRF。"""
     if request.method in SAFE_METHODS:
         return
     origin = request.headers.get("origin")
@@ -108,7 +99,7 @@ def require_same_origin(request: Request) -> None:
 
 
 def _extra_origins() -> set[str]:
-    """允许的前端地址（本地开发前端跑在 5173，与后端 8000 不同源）。"""
+    """从配置中取出额外允许的前端主机和端口，供写请求来源检查使用。"""
     raw = get_settings().allowed_origins
     return {
         item.split("://", 1)[-1].rstrip("/")
@@ -118,14 +109,14 @@ def _extra_origins() -> set[str]:
 
 
 def get_graph():
-    """面试图（正常变体）。恢复变体在 recovery 流程里单独取。"""
+    """提供正常答题用的图实例；需要从记录恢复时由恢复服务取另一种入口。"""
     from app.services import graph_runtime
 
     return graph_runtime.get_compiled_graph()
 
 
 def get_redis_client():
-    """幂等缓存客户端（§9.3 第 8 步）。测试可覆写。"""
+    """提供 Redis 客户端，给幂等响应缓存使用。"""
     from app.infrastructure.redis_client import get_redis
 
     return get_redis()
@@ -135,11 +126,10 @@ def get_current_user(
     request: Request,
     db: OrmSession = Depends(get_db),
 ) -> User | None:
-    """当前登录用户；未登录/令牌过期/签名不对一律返回 None（当作游客）。
+    """验证登录 Cookie 的签名和有效期，再按用户 ID 查账号；无效时按未登录处理。
 
     刻意不在这里抛 401：绝大多数接口（创建面试、答题）匿名也能用，
-    只有真正需要账号的接口才用 require_user 强制登录。
-    """
+    只有真正需要账号的接口才用 require_user 强制登录。"""
     settings = get_settings()
     token = request.cookies.get(settings.auth_cookie_name)
     user_id = parse_login_token(token, secret=settings.auth_secret)
@@ -149,7 +139,7 @@ def get_current_user(
 
 
 def require_user(user: User | None = Depends(get_current_user)) -> User:
-    """强制登录的依赖（留给"我的面试记录"这类接口用）。"""
+    """要求请求已经登录；没有有效账号就返回 AUTH_REQUIRED。"""
     if user is None:
         raise AuthRequiredError()
     return user

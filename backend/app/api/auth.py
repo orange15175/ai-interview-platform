@@ -54,6 +54,7 @@ class RegisterRequest(BaseModel):
     @field_validator("account")
     @classmethod
     def _account_charset(cls, v: str) -> str:
+        """去掉账号首尾空白并转小写，再检查长度和允许的字符。"""
         v = (v or "").strip().lower()
         if not ACCOUNT_PATTERN.match(v):
             raise ValueError("账号只能是 3~64 位字母、数字或 _ . @ + -")
@@ -62,6 +63,7 @@ class RegisterRequest(BaseModel):
     @field_validator("password")
     @classmethod
     def _password_strength(cls, v: str) -> str:
+        """检查密码长度、首尾空白及字符组合，不符合要求就拒绝注册。"""
         if len(v) > PASSWORD_MAX_LEN:
             raise ValueError(f"密码不能超过 {PASSWORD_MAX_LEN} 位")
         if len(v) < PASSWORD_MIN_LEN:
@@ -81,11 +83,13 @@ class LoginRequest(BaseModel):
     @field_validator("account")
     @classmethod
     def _normalize(cls, v: str) -> str:
+        """把登录账号转成与注册时相同的格式，避免大小写导致找不到账号。"""
         return (v or "").strip().lower()
 
     @field_validator("password")
     @classmethod
     def _length(cls, v: str) -> str:
+        """拒绝空密码和过长密码；登录时不重复要求密码强度。"""
         if not v:
             raise ValueError("请输入密码")
         if len(v) > PASSWORD_MAX_LEN:
@@ -94,7 +98,7 @@ class LoginRequest(BaseModel):
 
 
 def _iso_utc(value) -> str | None:
-    """统一按 UTC 输出，避免同一时刻有时 +00:00 有时 +08:00（前端解析容易踩坑）。"""
+    """把数据库时间统一转成 UTC 字符串，供浏览器正确解析。"""
     if value is None:
         return None
     if value.tzinfo is None:  # SQLite/旧数据可能读回 naive，按 UTC 解释
@@ -103,7 +107,7 @@ def _iso_utc(value) -> str | None:
 
 
 def _public_user(user: User) -> dict:
-    """对外只暴露账号与时间，任何哈希都不出去。"""
+    """只挑出可公开的账号信息，防止密码哈希进入响应。"""
     return {
         "user_id": str(user.id),
         "account": user.account,
@@ -113,6 +117,7 @@ def _public_user(user: User) -> dict:
 
 
 def _set_login_cookie(response: Response, user: User) -> None:
+    """签发带有效期的登录令牌，并写入浏览器脚本无法直接读取的 Cookie。"""
     settings = get_settings()
     token, max_age = issue_login_token(
         user.id, secret=settings.auth_secret, ttl_hours=settings.auth_ttl_hours
@@ -129,6 +134,7 @@ def _set_login_cookie(response: Response, user: User) -> None:
 
 
 def _clear_login_cookie(response: Response) -> None:
+    """让浏览器删除登录 Cookie；服务端不会撤销已经签发的令牌。"""
     settings = get_settings()
     response.delete_cookie(key=settings.auth_cookie_name, path="/")
 
@@ -139,7 +145,7 @@ def register(
     response: Response,
     db: OrmSession = Depends(get_db),
 ) -> dict:
-    """注册并直接登录。账号唯一由数据库唯一约束保证（并发注册也只会成功一个）。"""
+    """创建账号并提交数据库，然后下发登录 Cookie，实现注册后直接登录。"""
     user = users_repo.create(db, account=payload.account, password=payload.password)
     db.commit()
     _set_login_cookie(response, user)
@@ -153,6 +159,7 @@ def login(
     response: Response,
     db: OrmSession = Depends(get_db),
 ) -> dict:
+    """验证账号密码，成功后记录登录时间并下发 Cookie；账号不存在也做密码校验。"""
     user = users_repo.get_by_account(db, payload.account)
     # 账号不存在也要走一次哈希校验，避免"响应快慢"泄露账号是否存在
     stored = user.password_hash if user else _DUMMY_HASH
@@ -169,14 +176,14 @@ def login(
 
 @router.post("/logout", dependencies=[Depends(require_same_origin)])
 def logout(response: Response) -> dict:
-    """登出：清 Cookie 即可（令牌是无状态的，服务端不留会话表）。幂等。"""
+    """删除浏览器的登录 Cookie，重复调用也可以正常返回。"""
     _clear_login_cookie(response)
     return {"ok": True}
 
 
 @router.get("/me")
 def me(user: User | None = Depends(get_current_user)) -> dict:
-    """当前登录用户。未登录返回 user=null 而不是 401 —— 前端据此决定显示登录页还是主界面。"""
+    """返回当前登录用户；没有有效登录态时返回 user=null，供前端显示登录页。"""
     return {"user": _public_user(user) if user else None}
 
 

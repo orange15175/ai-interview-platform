@@ -47,6 +47,8 @@ class InterviewGraphState(TypedDict, total=False):
     # wait_answer 恢复后写入的候选人回答
     latest_answer: str
     answer_skipped: bool
+    # 当前主问题下的正式问答上下文；覆盖更新，换主问题清空，恢复时由数据库重建。
+    answer_history: list[dict]
 
     # 追加型：每题的评分记录（skipped 的题为 None）
     evaluations: Annotated[list[dict | None], operator.add]

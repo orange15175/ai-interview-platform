@@ -1,8 +1,15 @@
-"""面试 6 个 API（开发说明 §10），全部走匿名访客 Cookie 鉴权。
+"""面试接口：把前端动作翻译成可恢复的业务操作。
+
+阅读顺序：先看 create_interview，再看 get_current_question、submit_answer、
+finish_interview。下划线方法是接口内部步骤：_read_upload 负责安全读取文件，
+_run_preparation 负责后台准备，_set_stage 写前端进度，_fail_preparation 把
+异常收口成失败状态。已有会话的访问会在接口或业务服务内查询归属，确认当前身份有权访问。
+
+下面保留接口清单，方便从前端请求反查入口：
 
 接口清单与职责边界：
 - POST   /api/interviews                        multipart 上传材料 → 202 + session_id
-- GET    /api/interviews/{id}                   准备进度/可恢复性（只读，不推进题号）
+- GET    /api/interviews/{id}                   查询进度；必要时标记准备任务中断，不推进题号
 - GET    /api/interviews/{id}/current-question   当前题；checkpoint 丢失时自动触发恢复
 - POST   /api/interviews/{id}/answers            提交回答/跳过（幂等编排见 interview_workflow）
 - POST   /api/interviews/{id}/finish             用户提前结束（幂等）
@@ -11,7 +18,7 @@
 - POST   /api/interviews/{id}/retry-preparation  复用已存材料只重跑出题
 - POST   /api/interviews/{id}/recover            显式从 PostgreSQL 恢复会话
 
-两条诚实声明（§10，不得向用户隐瞒）：
+目前的实现边界：
 1. 准备任务是**进程内后台任务**：服务重启会让 PREPARING 会话变成孤儿。
    这里不做持久任务队列，靠"轮询时发现孤儿 → 标记 PREPARATION_FAILED"收口。
 2. 归属校验全部在仓储层 SQL 里做（get_owned），查不到一律 404，
@@ -56,13 +63,12 @@ router = APIRouter(prefix="/interviews", tags=["interviews"])
 # 进程内"正在准备"登记表。只用于孤儿检测，不承担跨进程语义。
 _preparing: set[str] = set()
 
-# 本进程启动时刻。早于它创建的 PREPARING 会话，必然是上一个进程留下的孤儿。
+# 本进程启动时刻；当前按单 worker 假设，把更早创建且未登记的准备任务当作孤儿。
+# 多 worker 或滚动启动时该判断可能误判，不能把它当作跨进程任务状态。
 _PROCESS_STARTED_AT = datetime.now(timezone.utc)
 
 # 本进程创建、但登记表里没有的 PREPARING 会话，要等这么久才判孤儿。
-# 为什么需要这层兜底：多 worker 部署时，会话可能正在**别的** worker 上解析出题，
-# 用"不在我的登记表里"直接判死，会把好好的会话标成失败（该任务随后发现状态已变，
-# 会静默跳过 → 会话永久失败）。等超时是唯一的无损判据。
+# 对本进程启动后创建的会话，多等一段时间再判失败，减少误判；它不是可靠的任务心跳。
 _PREPARATION_TIMEOUT_SECONDS = 180
 
 MAX_QUESTION_COUNT = 30  # 出题数上限（防费用失控，§11）
@@ -84,11 +90,10 @@ PREPARATION_STAGES = (
 
 
 def _as_aware_utc(value: datetime | None) -> datetime | None:
-    """统一成带时区的 UTC。
+    """把时间统一成带时区的 UTC，避免测试库与 PostgreSQL 的时间无法比较。
 
     PG 的 timestamptz 读回来已带时区；SQLite（测试）不存时区，读回来是 naive，
-    而写入时用的就是 UTC，所以无时区按 UTC 解释是安全的。
-    """
+    而写入时用的就是 UTC，所以无时区按 UTC 解释是安全的。"""
     if value is None:
         return None
     if value.tzinfo is not None:
@@ -97,7 +102,7 @@ def _as_aware_utc(value: datetime | None) -> datetime | None:
 
 
 def _is_orphan_preparing(session, session_id: str) -> bool:
-    """这个 PREPARING 会话是不是没人管了（进程重启/任务丢失）。"""
+    """根据本进程登记表、启动时间和等待时长，判断准备任务是否可能已中断。"""
     if session_id in _preparing:
         return False  # 本进程正在跑，绝不误杀
 
@@ -106,7 +111,7 @@ def _is_orphan_preparing(session, session_id: str) -> bool:
         return True  # 连时间都没有：数据异常，按孤儿收口，别让它永远 PREPARING
 
     if created < _PROCESS_STARTED_AT:
-        return True  # 重启前的会话：没人会再推进它了
+        return True  # 单 worker 假设下按旧进程中断处理；多进程时未必成立
 
     age = (datetime.now(timezone.utc) - created).total_seconds()
     return age > _PREPARATION_TIMEOUT_SECONDS
@@ -127,6 +132,7 @@ class AnswerIn(BaseModel):
     @field_validator("answer")
     @classmethod
     def _answer_not_blank(cls, v: str | None) -> str | None:
+        """回答字段如果提供就不能全是空白；不作答应明确提交 skip。"""
         if v is not None and not v.strip():
             raise ValueError("回答不能为空；如不想作答请用 submission_kind=skip")
         return v
@@ -141,13 +147,14 @@ def _owned_session(
     visitor: AnonymousVisitor,
     user: User | None = None,
 ):
-    """归属校验：匿名访客本人，或该会话绑定的登录账号。"""
+    """按当前身份查询会话：登录时认账号，匿名时只认本访客未绑定账号的会话。"""
     return sessions_repo.get_owned(
         db, session_id, visitor.id, user_id=user.id if user else None
     )
 
 
 def _validate_question_count(count: int | None) -> int | None:
+    """把用户指定题数限制在 1～30；未指定时留给配置决定默认值。"""
     if count is None:
         return None
     if not 1 <= count <= MAX_QUESTION_COUNT:
@@ -161,12 +168,7 @@ def _validate_question_count(count: int | None) -> int | None:
 async def _read_upload(
     file: UploadFile | None, *, limit_mb: int, label: str
 ) -> tuple[str | None, bytes | None]:
-    """分块读取上传文件，**累计超限立刻中止**。
-
-    为什么不能直接 await file.read()：那是先把整个文件读进内存再校验大小，
-    10 MiB 的限制只是事后检查。真有人传 1 GiB，进程会先把内存吃满再报错。
-    分块读 + 累计判断，超过上限时立刻停手，最坏只多读一个分片。
-    """
+    """分块读取已经由框架解析的上传文件，超过大小限制就停止继续读。"""
     if file is None:
         return None, None
 
@@ -192,10 +194,7 @@ async def _read_upload(
 
 
 def _quick_validate(filename: str | None, data: bytes | None, label: str) -> None:
-    """在 202 之前做一遍快速校验（大小/扩展名/魔数），让用户当场拿到错误。
-
-    完整的"能否真正打开"与解析在后台任务里做——那部分慢，不该阻塞响应。
-    """
+    """在受理前检查文件大小、格式和基本可读性，尽早把错误返回前端。"""
     if filename is None:
         return
     try:
@@ -208,7 +207,7 @@ def _quick_validate(filename: str | None, data: bytes | None, label: str) -> Non
 
 
 def _set_stage(db: OrmSession, session, stage: str, **extra) -> None:
-    """写准备阶段进度（每次都带 stage_started_at，前端才能算耗时）。"""
+    """保存准备阶段和开始时间，让前端知道当前在解析、出题还是保存题目。"""
     now = datetime.now(timezone.utc).isoformat()
     previous = session.progress or {}
     carried = {
@@ -230,7 +229,7 @@ def _set_stage(db: OrmSession, session, stage: str, **extra) -> None:
 
 def _fail_preparation(db: OrmSession, session_id: str, exc: AppError | None,
                       stage: str) -> None:
-    """失败收口：记录失败阶段 + 稳定错误码，绝不留下永远 PREPARING 的僵尸。"""
+    """回滚当前事务，再把失败阶段和错误写回会话，供前端提示原因。"""
     db.rollback()
     session = sessions_repo.get(db, session_id)
     if session is None:
@@ -245,11 +244,10 @@ def _fail_preparation(db: OrmSession, session_id: str, exc: AppError | None,
 
 
 def _run_questions_only(*, session_id: str) -> None:
-    """只重跑出题：材料从 PostgreSQL 读，**不重新解析、不要求重传简历**。
+    """读取已保存材料重新出题，省去再次上传和解析简历。
 
     出题失败时材料（往往已经花过视觉模型的钱）已经落库，重传一份简历等于
-    让用户为同一个错误付第二次钱（§十）。
-    """
+    让用户为同一个错误付第二次钱（§十）。"""
     from app.infrastructure.db import get_session_factory
     from app.repositories import materials as materials_repo
 
@@ -302,13 +300,12 @@ def _run_preparation(
     jd_bytes: bytes | None,
     jd_text: str | None,
 ) -> None:
-    """后台准备：解析 → 出题 → 启动图，停在第一题的等待点。
+    """后台依次提取文件、调用解析模型、保存材料、生成题目并启动答题图。
 
     全程自开数据库会话（后台任务拿不到请求级会话）。
     每个阶段都写进 session.progress（stage + stage_started_at），前端能显示
     "解析中/出题中/保存题目"，而不是一句含糊的"准备中"。
-    任何失败都收口成 PREPARATION_FAILED（终态 + 脱敏错误 + 失败阶段）。
-    """
+    任何失败都收口成 PREPARATION_FAILED（终态 + 脱敏错误 + 失败阶段）。"""
     from app.infrastructure.db import get_session_factory
 
     db = get_session_factory()()
@@ -378,6 +375,64 @@ def _run_preparation(
 # ---------------------------------------------------------------- 创建会话
 
 
+class SessionListItem(BaseModel):
+    """列表页一行：够渲染一张卡片，不含题干/作答原文。"""
+
+    session_id: str
+    status: str
+    question_count: int
+    answered_count: int
+    # 没有有效评分时为 null（不是 0，理由同报告）
+    overall_score: int | None = None
+    created_at: datetime
+    last_activity_at: datetime
+    # 已终结的会话不再能答题，但报告仍可看
+    finished: bool
+    # 能直接接着答（还在准备或答题中）
+    resumable: bool
+
+
+@router.get("", response_model=list[SessionListItem], summary="面试记录列表（只读）")
+def list_interviews(
+    limit: int = 20,
+    offset: int = 0,
+    visitor: AnonymousVisitor = Depends(get_visitor),
+    user: User | None = Depends(get_current_user),
+    db: OrmSession = Depends(get_db),
+) -> list[SessionListItem]:
+    """按当前身份返回最近的面试会话，最近的排前面。
+
+    归属规则与单会话读取完全一致（sessions_repo 里共用同一个 where 条件）：
+    登录态按账号，匿名态按访客 Cookie 且排除已被账号认领的会话。
+    """
+    sessions = sessions_repo.list_owned(
+        db, visitor.id, user_id=user.id if user else None, limit=limit, offset=offset
+    )
+    if not sessions:
+        return []
+
+    # 一次算出这一页所有会话的平均分，避免每行单独聚合（N+1）
+    averages = answers_repo.average_scores(db, [s.id for s in sessions])
+
+    items: list[SessionListItem] = []
+    for s in sessions:
+        avg = averages.get(s.id)
+        items.append(
+            SessionListItem(
+                session_id=str(s.id),
+                status=s.status,
+                question_count=s.question_count,
+                answered_count=int((s.progress or {}).get("answered_count") or 0),
+                overall_score=int(round(avg)) if avg is not None else None,
+                created_at=s.created_at,
+                last_activity_at=s.last_activity_at,
+                finished=s.status in sessions_repo.TERMINAL_STATUSES,
+                resumable=s.status in ("PREPARING", "IN_PROGRESS"),
+            )
+        )
+    return items
+
+
 @router.post(
     "",
     status_code=202,
@@ -401,11 +456,10 @@ async def create_interview(
     user: User | None = Depends(get_current_user),
     db: OrmSession = Depends(get_db),
 ) -> dict:
-    """202 + session_id：创建较快，准备结果靠轮询 GET /api/interviews/{id}。
+    """接收上传材料，校验后建会话并登记后台任务，返回 202 让前端轮询进度。
 
-    这是进程内后台任务（§10 的明确边界）：服务重启会中断准备，
-    孤儿会话在轮询时被标记 PREPARATION_FAILED，需要重新上传。
-    """
+    这是进程内后台任务：服务重启会中断准备，
+    孤儿会话在轮询时被标记 PREPARATION_FAILED，需要重新上传。"""
     question_count = _validate_question_count(question_count)
 
     limits = get_settings().business
@@ -478,11 +532,10 @@ def retry_preparation(
     user: User | None = Depends(get_current_user),
     db: OrmSession = Depends(get_db),
 ) -> dict:
-    """重新出题（不需要重传简历、不重新调用解析模型）。
+    """确认准备失败且材料已保存后，增加重试次数并再次登记出题任务。
 
     前提是解析结果已经落库；没落库说明失败发生在解析阶段，只能重新上传。
-    重试次数有限（每次失败都会记录阶段），避免无限重试把费用打上去。
-    """
+    重试次数有限（每次失败都会记录阶段），避免无限重试把费用打上去。"""
     from app.repositories import materials as materials_repo
 
     session = _owned_session(db, session_id, visitor, user)
@@ -506,6 +559,8 @@ def retry_preparation(
             code="RETRY_LIMIT_REACHED", http_status=409,
         )
 
+    # 当前先读后写，没有原子领取任务：并发点击可能同时通过上面的检查。
+    # 阅读时不要把 _preparing 集合误认为这里已经取得了分布式锁。
     _set_stage(db, session, "QUEUED", retry_count=retries + 1, attempt=retries + 1)
     sessions_repo.touch(
         db, session,
@@ -537,6 +592,7 @@ def get_interview(
     db: OrmSession = Depends(get_db),
     graph=Depends(get_graph),
 ) -> dict:
+    """返回会话进度；发现准备任务疑似中断时会把它写成准备失败。"""
     session = _owned_session(db, session_id, visitor, user)
 
     if session.status == "PREPARING" and _is_orphan_preparing(session, session_id):
@@ -579,12 +635,11 @@ def recover_interview(
     user: User | None = Depends(get_current_user),
     db: OrmSession = Depends(get_db),
 ) -> dict:
-    """把会话从 PostgreSQL 重建到安全等待点。
+    """先确认会话归属，再调用恢复服务，从数据库记录重建答题位置。
 
     什么时候需要它：提交回答返回 `STATE_RECOVERY_REQUIRED`（图位置与记录对不上），
     或者 Redis 里的执行状态丢了。恢复会拿会话锁、对账未完成提交，并对
-    已有评分的回答补齐裁决与快照——不会重新评分，也不会越过当前题。
-    """
+    已有评分的回答补齐裁决与快照——不会重新评分，也不会越过当前题。"""
     session = _owned_session(db, session_id, visitor, user)
     result = recover_session(
         db=db,
@@ -602,6 +657,7 @@ def get_current_question(
     db: OrmSession = Depends(get_db),
     graph=Depends(get_graph),
 ) -> dict:
+    """返回数据库记录的当前题；Redis 执行状态丢失时先自动恢复。"""
     session = _owned_session(db, session_id, visitor, user)
 
     if session.status == "PREPARING":
@@ -667,7 +723,7 @@ def submit_answer(
     graph=Depends(get_graph),
     redis_client=Depends(get_redis_client),
 ) -> dict:
-    """提交一次回答。同 request_id 重试原样回放；不同 request_id 同题被拒。"""
+    """校验回答或跳过参数，再交给业务服务完成幂等判断、评分和题序推进。"""
     skipped = body.submission_kind == "skip"
     if not skipped and not (body.answer or "").strip():
         raise AppError(
@@ -706,6 +762,7 @@ def finish_interview(
     user: User | None = Depends(get_current_user),
     db: OrmSession = Depends(get_db),
 ) -> dict:
+    """拿会话锁后把面试标成用户提前结束；重复结束直接返回现有终态。"""
     session = _owned_session(db, session_id, visitor, user)
 
     if session.status == "PREPARING":
@@ -770,7 +827,7 @@ def get_records(
     user: User | None = Depends(get_current_user),
     db: OrmSession = Depends(get_db),
 ) -> dict:
-    """已完成的问答记录。不包含内部评分要点（rubric），也不做总结报告。"""
+    """按题序返回已完成的正式问答，过滤失败提交和内部评分要点。"""
     session = _owned_session(db, session_id, visitor, user)
 
     questions = questions_repo.list_for_session(db, session.id)
@@ -818,14 +875,18 @@ def get_report(
     user: User | None = Depends(get_current_user),
     db: OrmSession = Depends(get_db),
 ) -> InterviewReport:
-    """把已落库的评分聚合成复盘报告。
+    """读取题目和回答生成复盘报告；只聚合现有记录，不额外调用模型。
 
-    三条边界（§3）：
+    三条边界：
     - **只读**：不调用任何模型，不改会话状态。同一份记录重复打开，结论一致。
     - **不泄题**：evaluation 里的 rubric_results（评分要点）一律不出现在响应里。
     - **不编数**：没有有效评分时 overall_score 为 null 并附说明，绝不用 0 分代替。
 
     会话还在答题中也允许看：此时报告只覆盖已完成的题目，notice 会写明。
+
+    落库策略（cache-aside）：终结且每题都有终态结果的报告会存进
+    interview_sessions.report_snapshot，之后直接读快照；否则每次现场聚合、
+    不写库——中途的报告本来就该随新的答题变化。
     """
     session = _owned_session(db, session_id, visitor, user)
     if session.status == "PREPARING":
@@ -834,8 +895,15 @@ def get_report(
             code="PREPARING", http_status=409, retryable=True,
         )
 
-    return reporting.build_report(
+    cached = reporting.load_snapshot(session)
+    if cached is not None:
+        return cached
+
+    report = reporting.build_report(
         session=session,
         questions=questions_repo.list_for_session(db, session.id),
         answers=answers_repo.list_for_session(db, session.id),
     )
+    # 不可固化（还在答题中／有失败题）时内部直接跳过，这里不用分支。
+    reporting.save_snapshot(db, session, report)
+    return report

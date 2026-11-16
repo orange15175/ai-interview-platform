@@ -18,10 +18,12 @@ from app.schemas.materials import ParsedMaterials
 
 
 def _as_uuid(value: uuid.UUID | str) -> uuid.UUID:
+    """把会话 ID 转成 UUID，供材料查询使用。"""
     return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
 
 
 def get(db: OrmSession, session_id: uuid.UUID | str) -> InterviewMaterial | None:
+    """读取指定会话保存的材料记录，未保存时返回 None。"""
     stmt = select(InterviewMaterial).where(
         InterviewMaterial.session_id == _as_uuid(session_id)
     )
@@ -29,11 +31,10 @@ def get(db: OrmSession, session_id: uuid.UUID | str) -> InterviewMaterial | None
 
 
 def load_parsed(db: OrmSession, session_id: uuid.UUID | str) -> ParsedMaterials | None:
-    """把已落库的解析结果还原成 ParsedMaterials。
+    """把数据库 JSON 重新校验成材料对象，供重试出题复用。
 
     "重试出题"靠它：材料解析已经花过钱、也已经校验过，出题失败没有理由
-    让用户再传一次简历、再解析一遍（§十 第 4 条）。
-    """
+    让用户再传一次简历、再解析一遍（§十 第 4 条）。"""
     row = get(db, session_id)
     if row is None:
         return None
@@ -55,7 +56,7 @@ def save_parsed(
     prompt_version: str = "v1",
     schema_version: str = "1",
 ) -> InterviewMaterial:
-    """写入/覆盖解析结果。同一会话重复解析（用户重新上传）时覆盖旧结果。"""
+    """保存或更新本会话的结构化材料及解析模型信息，不保存原上传文件。"""
     sid = _as_uuid(session_id)
     row = get(db, sid)
     if row is None:

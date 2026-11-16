@@ -29,6 +29,7 @@ class GeneratedQuestion(BaseModel):
     @field_validator("content")
     @classmethod
     def _no_blank(cls, v: str) -> str:
+        """去掉题干首尾空白，再拒绝实际没有文字的题目。"""
         v = v.strip()
         if not v:
             raise ValueError("题干为空")
@@ -36,6 +37,7 @@ class GeneratedQuestion(BaseModel):
 
     @property
     def rubric_weight_sum(self) -> float:
+        """计算本题全部评分要点的权重之和，供整套题目校验使用。"""
         return sum(p.weight for p in self.evaluation_rubric)
 
 
@@ -44,6 +46,7 @@ class QuestionSet(BaseModel):
 
     @model_validator(mode="after")
     def _validate_set(self) -> "QuestionSet":
+        """检查题目非空、编号连续、题干不重复、权重合理且题干未直接附标准答案。"""
         qs = self.questions
         if not qs:
             raise ValueError("题目集为空")
@@ -56,6 +59,7 @@ class QuestionSet(BaseModel):
 
         # 2) 题干不能重复（去掉空白与标点差异后比较）
         def fingerprint(text: str) -> str:
+            """只保留字母和数字来比较题干，忽略空白和标点造成的表面差异。"""
             return "".join(ch for ch in text if ch.isalnum())
 
         fps = [fingerprint(q.content) for q in qs]
@@ -76,10 +80,11 @@ class QuestionSet(BaseModel):
         return self
 
     def sorted_questions(self) -> list[GeneratedQuestion]:
+        """按主问题编号返回题目，保证模型输出乱序时仍按正确顺序面试。"""
         return sorted(self.questions, key=lambda q: q.main_index)
 
     def assert_evidence_exists(self, evidence_ids: set[str]) -> None:
-        """交叉校验：题目引用的依据必须真实存在。"""
+        """检查题目引用的材料依据 ID 都存在，防止引用不存在的来源。"""
         for q in self.questions:
             missing = [eid for eid in q.material_evidence_ids if eid not in evidence_ids]
             if missing:

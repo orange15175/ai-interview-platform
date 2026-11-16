@@ -208,3 +208,68 @@ def test_report_without_any_score_returns_null_overall(api):
     assert body["summary"]["overall_score"] is None  # 不是 0
     assert body["summary"]["score_coverage"] == 0.0
     assert body["notice"] and "没有足够有效评分数据" in body["notice"]
+
+
+# ---------------------------------------------------------------- 快照落库
+
+
+def _snapshot_of(api, sid: str) -> dict | None:
+    db = api.factory()
+    try:
+        session = db.get(InterviewSession, uuid.UUID(sid))
+        return session.report_snapshot
+    finally:
+        db.close()
+
+
+def test_report_is_persisted_once_finished(api):
+    """终结且每题都有结果 → 报告写进会话行，第二次 GET 直接读快照。"""
+    token, sid = _make_session(api.factory)
+    client = _client(token)
+
+    first = client.get(f"/api/interviews/{sid}/report").json()
+    assert _snapshot_of(api, sid) is not None
+    # 快照里不能有 rubric：落库内容和响应一样守"不泄题"
+    assert "rubric" not in str(_snapshot_of(api, sid))
+
+    # 改掉快照里的总分：如果还是现场聚合，就看不到 42
+    db = api.factory()
+    try:
+        session = db.get(InterviewSession, uuid.UUID(sid))
+        snapshot = dict(session.report_snapshot)
+        snapshot["summary"] = {**snapshot["summary"], "overall_score": 42}
+        session.report_snapshot = snapshot
+        db.commit()
+    finally:
+        db.close()
+
+    second = client.get(f"/api/interviews/{sid}/report").json()
+    assert second["summary"]["overall_score"] == 42
+    assert first["summary"]["overall_score"] != 42
+
+
+def test_report_not_persisted_while_in_progress(api):
+    """还在答题中：报告每次现算，绝不固化——否则后续答题改不了这份快照。"""
+    token, sid = _make_session(api.factory, status="IN_PROGRESS")
+    r = _client(token).get(f"/api/interviews/{sid}/report")
+    assert r.status_code == 200
+    assert _snapshot_of(api, sid) is None
+
+
+def test_report_not_persisted_when_a_question_is_unfinished(api):
+    """会话已终结但有题没结果 → 不固化；等补偿补完再存。"""
+    token, sid = _make_session(api.factory)
+    db = api.factory()
+    try:
+        session = db.get(InterviewSession, uuid.UUID(sid))
+        # 把其中一题改回 PENDING，模拟补偿任务还没跑完
+        answer = db.query(InterviewAnswer).filter_by(session_id=session.id).first()
+        answer.processing_status = "PENDING"
+        db.commit()
+    finally:
+        db.close()
+
+    r = _client(token).get(f"/api/interviews/{sid}/report")
+    assert r.status_code == 200
+    assert r.json()["summary"]["incomplete_count"] >= 1
+    assert _snapshot_of(api, sid) is None

@@ -23,7 +23,7 @@ load_dotenv(ENV_PATH, override=False)  # 已存在的进程环境变量优先，
 
 
 def _env(key: str, default: str = "") -> str:
-    """读环境变量并去掉首尾空白；空串表示未配置。"""
+    """读取环境变量并清除首尾空白，没有配置时使用传入默认值。"""
     return os.getenv(key, default).strip()
 
 
@@ -39,6 +39,7 @@ _warned_ephemeral = False
 
 
 def _ephemeral_auth_secret() -> str:
+    """没有固定签名密钥时使用本进程随机密钥，并只提醒一次重启会导致掉线。"""
     global _warned_ephemeral
     if not _warned_ephemeral:
         _warned_ephemeral = True
@@ -63,12 +64,13 @@ class TextModelConfig:
 
     @property
     def is_configured(self) -> bool:
-        """有 key 才算配置完成；base_url 缺省时用 DeepSeek 官方地址。"""
+        """仅判断文字模型密钥是否非空，不代表已经验证供应商连通性。"""
         return bool(self.api_key)
 
 
 def _text_model_config() -> TextModelConfig:
     # 兼容旧键：TEXT_* 未配置时回退到原型用的 OPENAI_* 键
+    """组装文字模型配置；新配置缺失时兼容旧环境变量，再使用默认模型地址。"""
     api_key = _env("TEXT_API_KEY") or _env("OPENAI_API_KEY")
     base_url = _env("TEXT_BASE_URL") or _env("OPENAI_BASE_URL") or "https://api.deepseek.com/v1"
     model = _env("TEXT_MODEL") or _env("MODEL_NAME") or "deepseek-chat"
@@ -87,11 +89,13 @@ class VisionModelConfig:
 
     @property
     def is_configured(self) -> bool:
+        """仅判断视觉模型密钥是否非空，不会发起真实请求。"""
         return bool(self.api_key)
 
 
 def _vision_model_config() -> VisionModelConfig:
     # 用户提供的确切参数：仅支持文本输出，调用时须带 modalities=["text"]
+    """读取视觉模型独立的模型名、地址和密钥，避免与文字模型混用。"""
     base_url = _env("VISION_BASE_URL") or "https://cn-beijing.maas.qianwenaiapi.com/compatible-mode/v1"
     return VisionModelConfig(
         model=_env("VISION_MODEL") or "qwen3.8-omni-flash",
@@ -115,7 +119,7 @@ DEFAULT_REDIS_URL = "redis://localhost:6380/0"
 
 @dataclass(frozen=True)
 class BusinessDefaults:
-    question_count: int = 15          # 固定 15 道主问题
+    question_count: int = 15          # 未在请求中指定题数时默认出 15 道主问题
     max_followups: int = 2            # 每道主问题最多追问 2 次
     max_file_mb: int = 10             # 单文件最大 10 MiB
     max_pdf_pages: int = 10           # PDF 最大 10 页
@@ -129,6 +133,7 @@ class BusinessDefaults:
 
 
 def _business_defaults() -> BusinessDefaults:
+    """读取题数、文件限制、有效期和锁参数，生成业务配置对象。"""
     return BusinessDefaults(
         question_count=int(_env("QUESTION_COUNT", "15") or 15),
         max_followups=int(_env("MAX_FOLLOWUPS_PER_QUESTION", "2") or 2),
@@ -145,7 +150,7 @@ def _business_defaults() -> BusinessDefaults:
 
 @dataclass(frozen=True)
 class Settings:
-    """全局配置快照。启动时构建一次，运行期只读。"""
+    """一份只读配置快照；get_settings 每次调用都会重新构建。"""
 
     text_model: TextModelConfig = field(default_factory=_text_model_config)
     vision_model: VisionModelConfig = field(default_factory=_vision_model_config)
@@ -177,13 +182,13 @@ class Settings:
 
     @property
     def llm_ready(self) -> bool:
-        """mock 模式或双模型都配好 key 时，模型层视为就绪。"""
+        """判断是否开启模拟模式或两套密钥均非空；这只是配置检查。"""
         if self.llm_mock:
             return True
         return self.text_model.is_configured and self.vision_model.is_configured
 
     def describe(self) -> dict:
-        """给 /api/health 的脱敏描述：只说配没配、用哪个模型，绝不带 key。"""
+        """生成健康接口可公开的模型配置说明，过滤密钥。"""
         return {
             "mock": self.llm_mock,
             "text_model": {
@@ -198,5 +203,5 @@ class Settings:
 
 
 def get_settings() -> Settings:
-    """每次调用重新读取环境（便于测试 monkeypatch 与热更新；运行期开销可忽略）。"""
+    """每次调用根据当前环境构建一份配置，便于测试切换参数。"""
     return Settings()
