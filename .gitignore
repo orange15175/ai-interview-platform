@@ -25,6 +25,12 @@ build/
 dist/
 *.egg-info/
 
+# 前端依赖与缓存
+node_modules/
+dist-ssr/
+.vite/
+*.tsbuildinfo
+
 # 日志
 *.log
 

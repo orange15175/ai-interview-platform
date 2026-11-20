@@ -1,0 +1,30 @@
+# 依赖
+node_modules/
+
+# 构建产物
+dist/
+dist-ssr/
+*.local
+
+# 环境变量（VITE_ 前缀会被打进客户端包，真实值绝不提交）
+.env
+.env.*
+!.env.example
+
+# 日志
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# 编辑器与系统
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# 缓存
+.cache/
+*.tsbuildinfo
+.vite/

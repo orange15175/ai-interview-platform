@@ -30,7 +30,7 @@ python -m venv ../.venv && ../.venv/Scripts/pip install -r requirements.txt
 #    不开也能用：失败提交仍可由用户手动重试，只是没有自动补偿
 ```
 
-前端在 `J:/develope/ai面试-前端`：`npm run dev` 后访问 http://localhost:5173（Vite 把 `/api` 同源代理到 8000，匿名 Cookie 无需跨源配置）。
+前端在同一仓库的 [`../frontend/`](../frontend/)：另开终端进入该目录，运行 `npm ci`、`npm run dev`，访问 http://localhost:5173（Vite 把 `/api` 同源代理到 8000，匿名 Cookie 无需跨源配置）。
 
 ## API 一览（详见 /docs OpenAPI）
 

@@ -1,0 +1,15 @@
+# 默认按文本处理并统一存 LF，检出时按平台转换
+* text=auto eol=lf
+
+# 明确的二进制文件，禁止任何转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.pdf binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.zip binary

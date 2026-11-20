@@ -4,7 +4,7 @@
 
 不是"套壳聊天"：把面试建模成状态机，题量、轮次、追问次数由代码控制，模型只负责"说什么"，不负责"流程往哪走"。
 
-> 前端仓库：[ai-interview-platform-web](https://github.com/orange15175/ai-interview-platform-web)
+前后端代码统一维护在本仓库：后端位于 [`backend/`](backend/)，前端位于 [`frontend/`](frontend/)。
 
 ## 流程
 
@@ -32,7 +32,7 @@
 | 存储 | PostgreSQL 16 | 正式记录（会话/题目/回答/评分/报告快照） |
 | 缓存 | Redis | checkpoint、会话锁、幂等缓存 |
 | 模型 | deepseek-chat / qwen3.8-omni-flash | 文本推理（出题评分追问） / 视觉解析（简历 JD） |
-| 前端 | React 19 + Vite + Tailwind | 独立仓库 |
+| 前端 | React 19 + TypeScript + Vite + Tailwind | 页面与交互，位于 `frontend/` |
 
 ## 目录
 
@@ -50,14 +50,28 @@
 │   │   └── models/          SQLAlchemy 表定义
 │   ├── migrations/          Alembic 迁移
 │   ├── tests/               单元 + 集成（默认零模型费用）
+│   ├── .env.example         后端配置模板（真实 Key 只放 .env）
 │   └── README.md            ★ 完整文档：接口、可靠性边界、隐私
-├── build_optimization_doc.py   设计文档生成器（产物不入库）
-└── .env.example                 配置模板（真实 Key 只放 .env）
+├── frontend/                React 前端
+│   ├── src/                 页面、组件、接口调用
+│   ├── package.json         依赖与启动命令
+│   ├── package-lock.json    锁定依赖版本
+│   ├── vite.config.ts       开发服务与 /api 代理
+│   └── README.md            前端启动与实现说明
+├── build_optimization_doc.py 设计文档生成器（产物不入库）
+└── README.md                项目介绍与启动说明
 ```
 
 ## 快速开始
 
 需要 Docker、Python 3.11+、Node 18+。
+
+克隆一次即可获得前后端代码：
+
+```bash
+git clone https://github.com/orange15175/ai-interview-platform-backend.git
+cd ai-interview-platform-backend
+```
 
 **1. 基础设施**
 
@@ -78,21 +92,32 @@ cp .env.example .env          # 填入 TEXT_API_KEY 与 VISION_API_KEY
 
 接口文档：http://127.0.0.1:8000/docs
 
-**3. 前端**（独立仓库）
+**3. 前端**（另开一个终端，从仓库根目录执行）
 
 ```bash
-git clone git@github.com:orange15175/ai-interview-platform-web.git
-cd ai-interview-platform-web
-npm install && npm run dev    # http://localhost:5173
+cd frontend
+npm ci
+npm run dev                 # http://localhost:5173
 ```
 
+开发服务将 `/api` 请求代理到 `http://127.0.0.1:8000`，请同时运行后端。完整前端说明见 [frontend/README.md](frontend/README.md)。
+
 **4. 测试**
+
+在后端终端运行（当前目录为 `backend/`）：
 
 ```bash
 ../.venv/Scripts/python -m pytest tests -q
 ```
 
 默认 `LLM_MOCK=1`，不连真实模型、不产生费用。
+
+前端构建与类型检查（当前目录为 `frontend/`）：
+
+```bash
+npm run build
+npx tsc --noEmit
+```
 
 ## 几个关键设计
 
